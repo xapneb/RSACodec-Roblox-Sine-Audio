@@ -1,0 +1,22 @@
+[project]
+name = "rsacodec-roblox-sine-audio"
+version = "0.0.0"
+description = "RSC/RSC2 additive-synthesis sine-wave codec for Roblox audio playback"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "librosa>=0.10",
+    "tqdm>=4.66",
+    "numba>=0.59",
+    "sounddevice>=0.4.6",
+]
+
+[project.optional-dependencies]
+# testing.py hotkeys; `keyboard` needs root on Linux, so it is optional.
+input = ["keyboard>=0.13.5"]
+
+[tool.uv]
+# No build step: the repo is a flat collection of scripts, not an installable package.
+package = false

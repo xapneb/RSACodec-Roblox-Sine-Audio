@@ -1,432 +1,315 @@
 #!/usr/bin/env python3
-"""
-RSC2 → Desmos Preprocessor  (streaming / unlimited edition)
-=============================================================
-Takes the JSON output of rsc2_encode_for_desmos.py and produces:
+"""RSC2 JSON → audio.player.html: a Desmos graph that sings.
 
-  1. player.html   — self-contained page that embeds the Desmos API and drives
-                     playback by hot-swapping F_n / A_n each frame via
-                     Calc.setExpression().  No list-size limit — all frame data
-                     lives in JS, not inside Desmos.
+The player drives one oscillator bank inside Desmos. It is the same shape of problem as the
+Roblox decoder, so it is solved the same way:
 
-  2. .desmos.json  — minimal Desmos state (just F_n=[], A_n=[], tone, viz).
-                     Load via Calc.setState() in the console if you want to poke
-                     at the expressions manually.
+  * One setExpressions() call per animation frame, updating both lists. Creating and destroying
+    tone() expressions mid-playback made Desmos recompile the graph and the frame rate slid, so
+    the expressions are all pre-baked and only their arguments change.
+  * A bin keeps its slot while it is sounding, instead of being re-sorted into a different slot
+    by amplitude every frame. Slot churn is what made partials pop in and out of existence.
+  * Gain is smoothed with a time constant of half a hop rather than stepped to the new frame's
+    value. A step every hop is the same click the codec side fixed with overlap-add.
+  * Timing runs off performance.now() and requestAnimationFrame. Ticking on setTimeout with an
+    integer millisecond value ran about 1% fast, which drifts, and dropping frames is what made
+    playback lurch.
+  * tone() duration is exactly one hop, not one hop and a bit. Overlapping tones sum, and the
+    sum of two overlapping copies of the same oscillator is a level that wobbles.
 
-  3. .exprs.txt    — human-readable expression listing for debug.
+The JSON it reads comes from rscd_encoder.py. See NOTES.md for what this build still cannot do.
 
-HOW IT WORKS
--------------
-All N oscillator slots are pre-baked into the Desmos state at startup as
-tone(F[n], G[n]) expressions referencing two lists F and G (length = max_partials).
-Each frame the player issues exactly ONE Calc.setExpressions() call that
-updates both F and G as complete lists.  No expressions are ever created or
-destroyed during playback — eliminating the per-expression parse/recompile
-overhead that caused frame-rate degradation even at low partial counts.
-
-PERFORMANCE
------------
-  Old approach: N setExpression calls/frame (one per changed slot) + Desmos
-                re-evaluates the graph N times.
-  New approach: 1 setExpressions call/frame with updated F+G lists. Desmos
-                re-evaluates once. Scales to hundreds of partials with no
-                frame-rate impact.
-
-LIMITATIONS
------------
-  * Only channel 0 is exported (Desmos is mono).
-  * Frequencies are clamped to 20-20000 Hz.
-  * Amplitudes are globally normalised to 0-1.
-  * tone() needs a user gesture — click the page before playback starts.
-  * max_partials must stay ≤ ~500 to keep list size inside Desmos limits.
+  uv run python rscd_prep.py audio.rscd
 """
 
-import json
 import argparse
+import json
 from pathlib import Path
 
-from numpy import add
+import rsc2_codec as codec
 
+MAX_PARTIALS_DEFAULT = 192
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def make_expression(id_str, latex, label=None, hidden=False, color="#00ff88"):
-    expr = {
-        "type":   "expression",
-        "id":     id_str,
-        "latex":  latex,
-        "color":  color,
-    }
-    if label:
-        expr["label"] = label
-    if hidden:
-        expr["hidden"] = True
-    return expr
-
-
-def make_folder(id_str, title, collapsed=True):
-    return {
-        "type":      "folder",
-        "id":        id_str,
-        "title":     title,
-        "collapsed": collapsed,
-    }
-
-
-# ── Core builder ─────────────────────────────────────────────────────────────
 
 def build_frames_js(data: dict, max_partials: int, channel: int = 0):
+    """Sparse frame tables. Each frame is a list of [bin, gain] pairs, gain already in units
+    of tone amplitude with the global peak folded in.
+
+    Slots are not decided here. The player keeps a bin in whichever slot it already occupies,
+    so the ordering of this list carries no meaning.
     """
-    Build the JS frame data for single-call list playback.
+    sr        = data["sample_rate"]
+    fft       = data["fft_size"]
+    hop       = data["hop_size"]
+    frames_in = data["channels"][channel]["frames"]
 
-    Each frame is stored as two flat arrays: F (frequencies) and G (gains),
-    both of length max_partials.  Unused slots get freq=20, gain=0.
-
-    The player issues exactly ONE Calc.setExpressions() per frame, updating
-    the F and G list expressions.  No dynamic expression creation/removal.
-
-    Output: RSC2_F and RSC2_G as JS arrays-of-arrays, indexed by frame.
-    Only frames that differ from a silent frame are stored; others are null.
-    """
-    sr      = data["sample_rate"]
-    hop     = data["hop_size"]
-    ch_data = data["channels"][channel]
-    frames  = ch_data["frames"]
-
-    freq_min, freq_max = 20.0, 20_000.0
-    hop_sec = hop / sr
-
-    # Global peak for normalisation
-    global_peak = max(
-        (p["amp_norm"] * f["peak"] for f in frames for p in f["partials"]),
-        default=1.0
-    )
+    hop_sec     = hop / sr
+    bin_hz      = sr / fft
+    global_peak = max((abs(p["amp_norm"] * f["peak"]) for f in frames_in for p in f["partials"]),
+                      default=1.0)
     if global_peak < 1e-12:
         global_peak = 1.0
 
-    n_frames   = len(frames)
-    all_F      = []   # list of F-arrays (or None for silent frames)
-    all_G      = []   # list of G-arrays (or None for silent frames)
-
-    for frame in frames:
-        partials = [
-            p for p in frame["partials"]
-            if freq_min <= p["freq_hz"] <= freq_max
-        ]
-        partials.sort(key=lambda p: p["amp_norm"], reverse=True)
-        partials = partials[:max_partials]
-
-        if not partials:
-            all_F.append(None)
-            all_G.append(None)
+    frames = []
+    for f in frames_in:
+        by_bin = {}
+        for p in f["partials"]:
+            gain = p["amp_norm"] * f["peak"] / global_peak
+            if p["freq_hz"] < 20.0 or p["freq_hz"] > 20000.0 or gain <= 1e-5:
+                continue
+            if p["bin"] not in by_bin or gain > by_bin[p["bin"]]:
+                by_bin[p["bin"]] = gain
+        if not by_bin:
+            frames.append([])
             continue
+        keep = sorted(by_bin.items(), key=lambda kv: kv[1], reverse=True)[:max_partials]
+        frames.append([[int(b), round(float(g), 5)] for b, g in keep])
 
-        F = [20.0] * max_partials
-        G = [0.0]  * max_partials
-        for slot, p in enumerate(partials):
-            F[slot] = round(max(freq_min, min(freq_max, p["freq_hz"])), 3)
-            G[slot] = round(max(0.0, min(1.0, (p["amp_norm"] * frame["peak"]) / global_peak)), 6)
+    loud = sum(1 for f in frames if f)
+    print(f"   {len(frames)} frames, {loud} with sound, {hop_sec * 1000:.2f} ms per frame, "
+          f"{bin_hz:.2f} Hz per bin")
 
-        all_F.append(F)
-        all_G.append(G)
-
-    tick_ms  = round(hop_sec * 1000)
-    tone_dur = round(hop_sec * 1.05, 6)
-
-    meta = {
-        "sample_rate":  sr,
-        "hop_size":     hop,
-        "hop_sec":      round(hop_sec, 6),
-        "tone_dur":     tone_dur,
-        "tick_ms":      tick_ms,
-        "n_frames":     n_frames,
-        "max_partials": max_partials,
-        "freq_max":     freq_max,
-    }
-
-    # Serialise as two sparse JS arrays (null for silent frames)
-    js = (
-        "const RSC2_F=" + json.dumps(all_F, separators=(",", ":")) + ";\n"
-        "const RSC2_G=" + json.dumps(all_G, separators=(",", ":")) + ";\n"
-    )
-
-    active = sum(1 for f in all_F if f is not None)
-    print(f"   Schedule: {n_frames} frames ({active} non-silent), "
-          f"{max_partials} slots, 1 setExpressions call/frame")
-
+    js = "const RSC2_FRAMES=" + json.dumps(frames, separators=(",", ":")) + ";\n"
+    meta = {"sample_rate": sr, "fft_size": fft, "hop_size": hop, "bin_hz": bin_hz,
+            "hop_sec": hop_sec, "n_frames": len(frames), "max_partials": max_partials}
     return js, meta
 
 
 def build_desmos_state(meta: dict):
-    """
-    Pre-bake ALL oscillator expressions into the initial Desmos state.
-
-    Structure:
-      F = [20, 20, ...]   ← frequency list, length = max_partials
-      G = [0,  0,  ...]   ← gain list,      length = max_partials
-      tone(F[1], G[1])    ← one expression per slot (1-indexed in Desmos)
-      tone(F[2], G[2])
-      ...
-
-    The player only ever calls setExpressions([{id:"F", latex:"F=[...]"},
-    {id:"G", latex:"G=[...]"}]) — one call, constant cost regardless of
-    how many partials are active.
-    """
-    freq_max     = meta["freq_max"]
+    """Pre-bake one tone() per slot plus the two lists they read."""
     max_partials = meta["max_partials"]
 
-    exprs     = []
-    txt_lines = []
+    exprs, txt = [], []
 
-    def add(id_str, latex, folder=None, hidden=False, color="#00ff88"):
-        e = make_expression(id_str, latex, hidden=hidden, color=color)
+    def add(id_str, latex, folder=None, color="#00ff88"):
+        e = {"type": "expression", "id": id_str, "latex": latex, "color": color}
         if folder:
             e["folderId"] = folder
         exprs.append(e)
-        txt_lines.append(f"  {id_str:12s}  {latex}")
+        txt.append(f"  {id_str:10s}  {latex}")
 
-    # ── Frequency and gain list variables ────────────────────────────────────
-    zeros  = ",".join(["0"]  * max_partials)
-    twenties = ",".join(["20"] * max_partials)
-    exprs.append(make_folder("fold_data", "🔒 Audio Data", collapsed=True))
-    add("F", f"F=[{twenties}]", color="#4488ff", folder="fold_data")
-    add("G", f"G=[{zeros}]",   color="#ff8844", folder="fold_data")
-    txt_lines.append("")
+    exprs.append({"type": "folder", "id": "fold_data", "title": "🔒 Audio Data",
+                  "collapsed": True})
+    add("F", "F=[" + ",".join(["20"] * max_partials) + "]", folder="fold_data", color="#4488ff")
+    add("G", "G=[" + ",".join(["0"] * max_partials) + "]", folder="fold_data", color="#ff8844")
+    txt.append("")
 
-    # ── tone() expressions, one per slot ─────────────────────────────────────
-    exprs.append(make_folder("fold_osc", f"🔊 Oscillators ({max_partials} slots)", collapsed=True))
-    txt_lines.append(f"  fold_osc     🔊 Oscillators ({max_partials} slots)")
+    exprs.append({"type": "folder", "id": "fold_osc",
+                  "title": f"🔊 Oscillators ({max_partials} slots)", "collapsed": True})
+    for i in range(1, max_partials + 1):
+        add(f"o{i}", f"tone(F[{i}],G[{i}])", folder="fold_osc")
 
-    add("audio", "\\operatorname{tone}\\left(F,G\\right)", color="#00ff88")
-
-    graph = {
-        "viewport":     {"xmin": 0, "xmax": freq_max, "ymin": -0.05, "ymax": 1.1},
-        "xAxisLabel":   "Frequency (Hz)",
-        "yAxisLabel":   "Amplitude",
-        "showGrid":     True,
-        "squareAxes":   False,
-        "polarMode":    False,
-        "xAxisNumbers": True,
-        "yAxisNumbers": True,
-    }
-    state = {
-        "version":     11,
-        "graph":       graph,
-        "expressions": {"list": exprs},
-        "randomSeed":  "rsc2",
-    }
-    return state, "\n".join(txt_lines)
+    state = {"version": 11,
+             "graph": {"viewport": {"xmin": 0, "xmax": 20000, "ymin": -0.05, "ymax": 1.1},
+                       "xAxisLabel": "Frequency (Hz)", "yAxisLabel": "Amplitude",
+                       "showGrid": True, "squareAxes": False, "polarMode": False,
+                       "xAxisNumbers": True, "yAxisNumbers": True},
+             "expressions": {"list": exprs}, "randomSeed": "rsc2"}
+    return state, "\n".join(txt)
 
 
-def build_player_html(js_data: str, desmos_state: dict, meta: dict) -> str:
-    state_json   = json.dumps(desmos_state)
-    tick_ms      = meta["tick_ms"]
-    n_frames     = meta["n_frames"]
-    max_partials = meta["max_partials"]
-
-    # Build the silent-frame F/G latex strings once (reused every silent frame)
-    silent_F = "[" + ",".join(["20"] * max_partials) + "]"
-    silent_G = "[" + ",".join(["0"]  * max_partials) + "]"
-
-    return f"""<!DOCTYPE html>
+PLAYER_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>RSC2 → Desmos Player</title>
+<title>RSC2/DESMOS player</title>
 <script src="https://www.desmos.com/api/v1.12/calculator.js?apiKey=dcb31709b452b1cf9dc26972add0fda6"></script>
 <style>
-    *{{margin:0;padding:0;box-sizing:border-box}}
-    body{{background:#0d0d1a;color:#e0e0ff;font-family:monospace;display:flex;flex-direction:column;height:100vh}}
-    #header{{padding:10px 16px;background:#080810;border-bottom:1px solid #1a1a3a;display:flex;align-items:center;gap:14px}}
-    h1{{font-size:13px;color:#00ff88;letter-spacing:3px;text-transform:uppercase;white-space:nowrap}}
-    button{{background:#0d0d1a;border:1px solid #00ff88;color:#00ff88;padding:5px 12px;
-            font-family:monospace;font-size:12px;cursor:pointer;border-radius:2px;transition:all .1s}}
-    button:hover{{background:#00ff88;color:#0d0d1a}}
-    button:disabled{{opacity:.3;cursor:default;border-color:#333}}
-    #progress{{flex:1;height:3px;background:#1a1a3a;border-radius:1px;cursor:pointer;position:relative}}
-    #progress-bar{{height:100%;background:#00ff88;width:0%}}
-    #info{{font-size:10px;color:#444;white-space:nowrap}}
-    #calculator{{flex:1}}
+    body{background:#0d0d1a;color:#e0e0ff;font-family:monospace;margin:0;display:flex;flex-direction:column;height:100vh}
+    #header{padding:10px 16px;background:#080810;border-bottom:1px solid #1a1a3a;display:flex;align-items:center;gap:14px}
+    h1{font-size:13px;color:#00ff88;letter-spacing:3px;text-transform:uppercase;margin:0}
+    button{background:#0d0d1a;border:1px solid #00ff88;color:#00ff88;padding:5px 12px;cursor:pointer}
+    button:hover{background:#00ff88;color:#0d0d1a}
+    button:disabled{opacity:.3;cursor:default;border-color:#333}
+    #seek{flex:1;height:22px;background:#1a1a3a;position:relative;cursor:pointer}
+    #seek:focus-visible{outline:2px solid #00ff88;outline-offset:2px}
+    #seek-bar{height:100%;background:#00ff88;width:0%}
+    #info{font-size:10px;color:#8899aa;white-space:nowrap}
+    #calculator{flex:1}
 </style>
 </head>
 <body>
 <div id="header">
     <h1>⬡ RSC2/DESMOS</h1>
-    <button id="btn-play" onclick="startPlayback()">▶ Play</button>
-    <button id="btn-stop" onclick="stopPlayback()" disabled>■ Stop</button>
-    <div id="progress" onclick="seekTo(event)"><div id="progress-bar"></div></div>
-    <div id="info">frame 0 / {n_frames}</div>
+    <button id="btn-play">Play</button>
+    <button id="btn-stop" disabled>Stop</button>
+    <div id="seek" role="slider" aria-label="Seek" aria-valuemin="0" aria-valuemax="__N__"
+         aria-valuenow="0" tabindex="0"><div id="seek-bar"></div></div>
+    <div id="info">frame 0 / __N__</div>
 </div>
 <div id="calculator"></div>
 <script>
-// RSC2 frame data — two arrays-of-arrays (null = silent frame)
-{js_data}
+"use strict";
+__FRAMES_JS__
+const HOP_SEC = __HOP_SEC__;
+const BIN_HZ  = __BIN_HZ__;
+const N       = RSC2_FRAMES.length;
+const SLOTS   = __SLOTS__;
+const TAU     = HOP_SEC * 0.5;
 
-// ── Desmos setup ──────────────────────────────────────────────────────────────
-const Calc = Desmos.GraphingCalculator(
-    document.getElementById('calculator'),
-    {{ expressionList:true, settingsMenu:true, keypad:false, zoomButtons:true }}
-);
-Calc.setState({state_json});
+const Calc = Desmos.GraphingCalculator(document.getElementById("calculator"),
+                                       {expressionList: true, settingsMenu: true,
+                                        keypad: false, zoomButtons: true});
+Calc.setState(__STATE__);
 
-// Pre-built silent latex strings (avoids rebuilding every silent frame)
-const SILENT_F = "F={silent_F}";
-const SILENT_G = "G={silent_G}";
+// A bin keeps the slot it was given. Re-sorting slots by gain every frame is what made
+// partials change identity mid-note, so this table is keyed by bin and never reshuffled.
+const slotBin = new Array(SLOTS).fill(-1);
+const target  = new Float64Array(SLOTS);
+const current = new Float64Array(SLOTS);
+const seen    = new Uint8Array(SLOTS);
 
-// ── Frame application — exactly ONE setExpressions call per frame ─────────────
-function applyFrame(fi) {{
-    const F = RSC2_F[fi];
-    const G = RSC2_G[fi];
+function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
 
-    if (F !== null && G !== null) {{
-        Calc.setExpressions([
-            {{ id: "F", latex: "F=[" + F.join(",") + "]" }},
-            {{ id: "G", latex: "G=[" + G.join(",") + "]" }},
-        ]);
-    }} else {{
-        Calc.setExpressions([
-            {{ id: "F", latex: SILENT_F }},
-            {{ id: "G", latex: SILENT_G }},
-        ]);
-    }}
+function assignFrame(fi) {
+    const frame = RSC2_FRAMES[fi];
+    seen.fill(0);
+    for (const entry of frame) {
+        const bin = entry[0], gain = entry[1];
+        let slot = slotBin.indexOf(bin);
+        if (slot < 0) {
+            for (let s = 0; s < SLOTS; s++) {
+                if (slotBin[s] < 0) { slot = s; break; }
+            }
+        }
+        if (slot < 0) {                       // no free slot: take the quietest one
+            slot = 0;
+            for (let s = 1; s < SLOTS; s++) { if (current[s] < current[slot]) slot = s; }
+        }
+        slotBin[slot] = bin;
+        seen[slot]    = 1;
+        target[slot]  = gain;
+    }
+    for (let s = 0; s < SLOTS; s++) {
+        if (!seen[s]) {
+            target[s] = 0.0;
+            if (current[s] < 1e-4) slotBin[s] = -1;
+        }
+    }
+}
 
-    document.getElementById('info').textContent         = `frame ${{fi + 1}} / {n_frames}`;
-    document.getElementById('progress-bar').style.width = `${{(fi + 1) / {n_frames} * 100}}%`;
-}}
+function pushLists() {
+    const f = new Array(SLOTS), g = new Array(SLOTS);
+    for (let s = 0; s < SLOTS; s++) {
+        f[s] = (slotBin[s] > 0 ? slotBin[s] : 1) * BIN_HZ;
+        g[s] = clamp(current[s], 0.0, 1.0);
+    }
+    Calc.setExpressions([{id: "F", latex: "F=[" + f.join(",") + "]"},
+                         {id: "G", latex: "G=[" + g.join(",") + "]"}]);
+}
 
-// ── Playback control ──────────────────────────────────────────────────────────
-let frameIdx = 0;
-let timer    = null;
-const TICK   = {tick_ms};
-const N      = {n_frames};
-let startTime = null;
+let playing = false, startTs = 0, lastTs = 0, lastFrame = -1;
 
-function startPlayback() {{
-    if (timer) return;
-    document.getElementById('btn-play').disabled = true;
-    document.getElementById('btn-stop').disabled = false;
-    frameIdx = 0;
-    
-    startTime = performance.now();
+function step(ts) {
+    if (!playing) return;
+    const dt = Math.min(0.1, (ts - lastTs) / 1000) || 0;
+    lastTs = ts;
+    const elapsed = (ts - startTs) / 1000;
+    const fi = clamp(Math.floor(elapsed / HOP_SEC), 0, N - 1);
+    if (fi !== lastFrame) { assignFrame(fi); lastFrame = fi; }
 
-    function tick() {{
-        const now = performance.now();
-        const elapsed = now - startTime;
-        
-        // Calculate which frame should be playing RIGHT NOW
-        targetFrame = Math.min(Math.floor(elapsed / TICK), N - 1);
-        
-        // Apply that frame (even if we skipped some)
-        applyFrame(targetFrame);
-        
-        // Schedule next check for the upcoming frame boundary
-        const nextFrameTime = startTime + (targetFrame + 1) * TICK;
-        const delay = Math.max(0, nextFrameTime - now);
-        
-        if (targetFrame < N - 1) {{
-            timer = setTimeout(tick, delay);
-        }} else {{
-            stopPlayback();
-        }}
-    }}
-    tick();
-}}
+    const k = 1.0 - Math.exp(-dt / TAU);          // ramp toward the new frame, no steps
+    for (let s = 0; s < SLOTS; s++) current[s] += (target[s] - current[s]) * k;
+    pushLists();
 
-function stopPlayback() {{
-    clearTimeout(timer);
-    timer = null;
-    Calc.setExpressions([
-        {{ id: "F", latex: SILENT_F }},
-        {{ id: "G", latex: SILENT_G }},
-    ]);
-    document.getElementById('btn-play').disabled = false;
-    document.getElementById('btn-stop').disabled = true;
-}}
+    document.getElementById("info").textContent = "frame " + (fi + 1) + " / " + N;
+    document.getElementById("seek-bar").style.width = ((fi + 1) / N * 100) + "%";
+    document.getElementById("seek").setAttribute("aria-valuenow", String(fi + 1));
+    if (elapsed >= N * HOP_SEC) { stop(); return; }
+    requestAnimationFrame(step);
+}
 
-function seekTo(e) {{
-    const t = (e.clientX - e.currentTarget.getBoundingClientRect().left) / e.currentTarget.offsetWidth;
-    frameIdx = Math.max(0, Math.min(N - 1, Math.floor(t * N)));
-    targetFrame = Math.max(0, Math.min(N - 1, Math.floor(t * N)));
-    startTime = performance.now() - (targetFrame * TICK);
-    applyFrame(frameIdx);
-}}
+function start() {
+    if (playing) return;
+    playing = true; lastFrame = -1;
+    startTs = performance.now(); lastTs = startTs;
+    document.getElementById("btn-play").disabled = true;
+    document.getElementById("btn-stop").disabled = false;
+    requestAnimationFrame(step);
+}
 
-applyFrame(0);
+function stop() {
+    playing = false;
+    for (let s = 0; s < SLOTS; s++) { target[s] = 0.0; current[s] = 0.0; slotBin[s] = -1; }
+    pushLists();
+    document.getElementById("btn-play").disabled = false;
+    document.getElementById("btn-stop").disabled = true;
+}
+
+function jumpTo(seconds) {
+    startTs = performance.now() - clamp(seconds, 0, N * HOP_SEC);
+    lastFrame = -1;
+}
+
+function seekFromEvent(e) {
+    const r = document.getElementById("seek").getBoundingClientRect();
+    const frac = clamp((e.clientX - r.left) / r.width, 0, 1);
+    if (playing) { jumpTo(frac * N * HOP_SEC); return; }
+    const fi = clamp(Math.floor(frac * N), 0, N - 1);
+    assignFrame(fi);
+    for (let s = 0; s < SLOTS; s++) current[s] = target[s];
+    pushLists();
+    document.getElementById("seek-bar").style.width = ((fi + 1) / N * 100) + "%";
+}
+
+document.getElementById("btn-play").addEventListener("click", start);
+document.getElementById("btn-stop").addEventListener("click", stop);
+document.getElementById("seek").addEventListener("click", seekFromEvent);
+document.getElementById("seek").addEventListener("keydown", function (e) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const now = playing ? (performance.now() - startTs) / 1000 : 0;
+    jumpTo(now + (e.key === "ArrowRight" ? 5 : -5));
+});
+
+pushLists();
 </script>
 </body>
 </html>
 """
 
 
-# ── Clipboard / console helper ─────────────────────────────────────────────────
+def build_player_html(js_data: str, state: dict, meta: dict) -> str:
+    return (PLAYER_HTML
+            .replace("__FRAMES_JS__", js_data)
+            .replace("__STATE__", json.dumps(state))
+            .replace("__HOP_SEC__", repr(round(meta["hop_sec"], 9)))
+            .replace("__BIN_HZ__", repr(round(meta["bin_hz"], 9)))
+            .replace("__SLOTS__", str(meta["max_partials"]))
+            .replace("__N__", str(meta["n_frames"])))
 
-CONSOLE_INSTRUCTIONS = """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  HOW TO USE                                                                  ║
-║                                                                              ║
-║  OPTION A — player.html  (recommended, no list limit 🚀)                   ║
-║    Open  {player_path}  in your browser.                                    ║
-║    Click ▶ Play, then unmute Desmos (🔇 → 🔊 top-left of graph).           ║
-║    Click the progress bar to seek.                                           ║
-║                                                                              ║
-║  OPTION B — raw Desmos state  (manual / debug)                              ║
-║    1. Open  https://desmos.com/calculator                                   ║
-║    2. F12 Console → run:                                                     ║
-║         fetch('{json_path}')                                                ║
-║           .then(r=>r.json()).then(s=>Calc.setState(s))                      ║
-║    3. F_n and A_n start empty — you must drive them from JS yourself.       ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-"""
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="RSC2 JSON → player.html + Desmos state (streaming, no list limit)")
-    ap.add_argument("input",          help="JSON output from rsc2_encode_for_desmos.py")
-    ap.add_argument("--output",       help="Output base path (default: input stem)")
-    ap.add_argument("--max-partials", type=int, default=192,
-                    help="Max partials per frame (default 192)")
-    ap.add_argument("--channel",      type=int, default=0,
-                    help="Which channel to export (default 0)")
+    ap = argparse.ArgumentParser(description="RSC2 JSON → player.html + Desmos state")
+    ap.add_argument("input", help="JSON from rscd_encoder.py")
+    ap.add_argument("--output", help="base path, default is the input's stem")
+    ap.add_argument("--max-partials", type=int, default=MAX_PARTIALS_DEFAULT,
+                    help="oscillator slots to pre-bake (default 192)")
+    ap.add_argument("--channel", type=int, default=0)
     a = ap.parse_args()
 
     src  = Path(a.input)
     base = Path(a.output) if a.output else src.with_suffix("")
+    print(f"📂 {src}")
+    data = json.loads(src.read_text())
+    print(f"   {data['sample_rate']} Hz | {data['n_channels']} ch | {data['n_frames']} frames | "
+          f"{data['duration_sec']:.2f} s")
 
-    print(f"📂 Loading {src} …")
-    with open(src) as f:
-        data = json.load(f)
-
-    print(f"   {data['sample_rate']} Hz | {data['n_channels']} ch | "
-          f"{data['n_frames']} frames | {data['duration_sec']:.2f}s")
-    print(f"   Exporting ch {a.channel} | ALL {data['n_frames']} frames | "
-          f"{a.max_partials} partials/frame")
-
-    js_frames, meta = build_frames_js(data, max_partials=a.max_partials, channel=a.channel)
+    frames_js, meta = build_frames_js(data, a.max_partials, a.channel)
     state, txt      = build_desmos_state(meta)
-    html            = build_player_html(js_frames, state, meta)
+    html            = build_player_html(frames_js, state, meta)
 
-    player_path = base.with_suffix(".player.html")
-    desmos_path = base.with_suffix(".desmos.json")
-    exprs_path  = base.with_suffix(".exprs.txt")
+    player = base.with_suffix(".player.html")
+    desmos = base.with_suffix(".desmos.json")
+    exprs  = base.with_suffix(".exprs.txt")
+    player.write_text(html)
+    desmos.write_text(json.dumps(state))
+    exprs.write_text("RSC2 → Desmos expressions\n" + "=" * 60 + "\n\n" + txt + "\n")
 
-    player_path.write_text(html)
-    with open(desmos_path, "w") as f:
-        json.dump(state, f, indent=2)
-    with open(exprs_path, "w") as f:
-        f.write("RSC2 → Desmos  expression listing\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(txt + "\n")
-
-    print(f"\n✅ Output files:")
-    print(f"   🌐 {player_path}   ({player_path.stat().st_size/1024:.0f} KB)  ← open this!")
-    print(f"   📊 {desmos_path}   ({desmos_path.stat().st_size/1024:.1f} KB)")
-    print(f"   📝 {exprs_path}")
-    print(CONSOLE_INSTRUCTIONS.format(
-        player_path=player_path.resolve(),
-        json_path=desmos_path.resolve()))
+    print(f"\n🌐 {player}  ({player.stat().st_size / 1024:.0f} KB)  ← open this")
+    print(f"📊 {desmos}  ({desmos.stat().st_size / 1024:.1f} KB)")
+    print(f"📝 {exprs}\n")
+    print("   Click Play, then unmute the graph. Click the bar to seek, arrows to nudge.\n")
 
 
 if __name__ == "__main__":
