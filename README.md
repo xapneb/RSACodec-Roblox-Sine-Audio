@@ -1,10 +1,4 @@
-**FINISHED PROJECT**
-
-This is probably the last commit before I abandon this project!
-
-It was a very very well performing codec, but its time to sunset it.
-
-In the future, I may port this project to other platforms, such as **Desmos**.
+Bru new audiostreamwriter thing came out I NEED ITTTT
 
 Just sine-wave stuff  
 Audio goes in clean come out not so clean on the other side
