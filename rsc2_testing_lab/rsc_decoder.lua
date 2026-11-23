@@ -173,6 +173,7 @@ function StreamEngine.tryNew(dec)
 	self.dead        = false
 	self.clips       = 0
 	self.shortWrites = 0
+	self.sumBuf      = table.create(dec.hopSize)  -- scratch for the partial-outer render
 
 	local setup = pcall(function()
 		if self.channels == 2 then
@@ -187,6 +188,8 @@ function StreamEngine.tryNew(dec)
 	end
 
 	self.writer = writer
+	-- Graph nodes must be in the DataModel tree to resolve pins.
+	writer.Parent = workspace
 
 	-- Without a sink the stream exists but nobody hears it, so this is a hard requirement.
 	local sink = deviceOutput()
@@ -205,8 +208,12 @@ function StreamEngine.tryNew(dec)
 		end
 	end)
 	wire.TargetInstance = sink
-	wire.Parent = workspace
+	wire.TargetName = "Input"
+	wire.Parent = writer
 	self.wire = wire
+	if not wire.Connected then
+		warn("[RSC2/stream] wire not connected; graph may be broken")
+	end
 
 	-- A bin is a frequency, so a bin owns its slot for the life of the partial. No identity churn,
 	-- no re-sorting by amplitude. reg[bin] is the slot, list[] is what the mix loop walks.
@@ -340,27 +347,41 @@ function StreamEngine:render(frames)
 			local count = #list
 			local buf   = buffers[ch]
 			local base  = done * 4
-			for k = 0, seg - 1 do
-				local sum = 0
-				for j = 1, count do
-					local s = list[j]
-					local ph = s.ph + s.inc
-					if ph >= 1 then
-						ph = ph - 1
-					end
-					s.ph = ph
-					s.amp = s.amp + (s.target - s.amp) * rampK
-					local x   = ph * SIN_N
-					local idx = floor(x)
-					sum = sum + s.amp * (SIN_TAB[idx + 1]
-						+ (SIN_TAB[idx + 2] - SIN_TAB[idx + 1]) * (x - idx))
+			local sumBuf = self.sumBuf
+
+			for k = 1, seg do
+				sumBuf[k] = 0
+			end
+
+			-- One 3-term recurrence roll per partial instead of floor + two table reads
+			-- per sample: s(m+1) = 2 cos(w) s(m) - s(m-1). Seeded from the wavetable once
+			-- per hop, so drift re-seeds before it can accumulate.
+			for j = 1, count do
+				local s   = list[j]
+				local inc = s.inc
+				local ph  = s.ph
+				local b1  = math.sin((ph + inc) * TAU)
+				local b0  = math.sin(ph * TAU)
+				local w   = 2 * math.cos(TAU * inc)
+				local amp, target = s.amp, s.target
+				for k = 1, seg do
+					amp = amp + (target - amp) * rampK
+					sumBuf[k] = sumBuf[k] + amp * b1
+					local nb = w * b1 - b0
+					b0, b1 = b1, nb
 				end
+				s.ph  = (ph + inc * seg) % 1
+				s.amp = amp
+			end
+
+			for k = 1, seg do
+				local sum = sumBuf[k]
 				if sum > 1 then
 					sum, clips = 1, clips + 1
 				elseif sum < -1 then
 					sum, clips = -1, clips + 1
 				end
-				buffer.writef32(buf, base + k * 4, sum)
+				buffer.writef32(buf, base + (k - 1) * 4, sum)
 			end
 		end
 
