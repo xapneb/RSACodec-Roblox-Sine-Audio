@@ -79,11 +79,77 @@ trick that costs side info is charged **inside** the budget or the comparison do
   band, so the floor lands at the top and the quiet members are left behind. 93% of dead
   bands live in multi-band runs, so this is not an edge case. A floor 20 dB low is
   effectively no fill, and a floor 7 dB high is noise above the very threshold that justified
-  zeroing. The mean-in-dB (geometric) alternative is the same price and is being measured
-  against it; if it doesn't fix the tail, a run needs a small residual word per band and the
-  bill has to be re-derived. Until this is settled the fill stays out of `rsc3_codec.py`.
+  zeroing. The mean-in-dB (geometric) alternative was measured against it, at the same price,
+  and it is not the fix it looked like:
 
-## What is not
+  | floor       | gain-fitted ES | audible | 16-17 kHz | 18-19 kHz |
+  |-------------|---------------:|--------:|----------:|----------:|
+  | source      |            --- |     --- |     -62.0 |     -62.0 |
+  | linear mean |           7.96 |   -53.1 |     -63.4 |     -64.3 |
+  | geometric   |           8.27 |   -53.4 |     -65.9 |     -68.1 |
+  | no fill     |           9.11 |   -55.9 |     -74.5 |     -76.8 |
+
+  The geometric mean wins both error metrics by about 0.3 dB for a reason that should not
+  fool anyone: it is simply *quieter*, so there is less noise to be wrong about. It buys
+  that by giving up 1.6-3.8 dB of the density the fill exists to restore, putting 18-19 kHz
+  6.1 dB under source where linear sits 2.3 dB under. A metric that improves when you do
+  less of the intended job is not evidence of a better design - this is the zero-fill result
+  wearing a different hat. Linear stays.
+
+  Which leaves the honest statement about fill, and it is not the one this section had:
+  fill is a *cost*, not a win, by both rulers that decide quality. `nofill` scores 9.11 dB
+  and -55.9 dB; `run_lin` scores 7.96 and -53.1. It buys 11-12 dB of restored density above
+  16 kHz and nothing either metric rewards, so it is a listening decision priced at about
+  1.1 dB of ES and 2.8 dB of audible error. It stays behind a flag, and `fill_experiment.py`
+  is the place that price gets re-derived.
+
+## Speed
+
+The encoder is the slow part, and the profile was not where I expected. Analysis is ~60x
+realtime on its own and never the problem; `allocate` was 88% of encode time, and inside
+`allocate` the water-filling bisection was most of it.
+
+Three changes, each measured, each checked for bit-identity against the version it replaced,
+because an allocation that changes is a different codec and not a faster one:
+
+- **Water-filling is a selection, not a search.** Bit *b* of band k exists while
+  `floor < S_k - 6.02(b-1)`, so that expression is the *price* of the bit, and the frame's
+  total is a count of prices above the floor. The lowest floor fitting a budget is therefore
+  the (budget+1)-th largest price, which is `argpartition` rather than sixty passes over the
+  frame. About 5x faster on the stage, **bit-identical across every coefficient of two files**
+  (1,445,888 comparisons). The bisection is kept as `_waterfill_all` and reachable with
+  `allocate(..., search=True)` precisely so that claim stays checkable.
+- **Analysis and synthesis run in blocks** rather than a per-frame loop: ~1.7x on each stage,
+  identical to ~1e-15. The overlap-add is the pairwise sum that `hop = N/2` admits, but note
+  that form drops the previous chunk's tail at every `CHUNK` boundary unless it is carried
+  forward - it was wrong for exactly that reason before it was caught.
+- **The mask's skirt is a cumulative sum, not a matrix** - and this is the one where *how*
+  you vectorize mattered more than whether. The kernel is `10^(-c*(z_i - z_j))` and the
+  attenuation is linear in ERB-rate, so it factors as `10^(-c*z_i) * 10^(+c*z_j)`: rank one,
+  and summing maskers above or below bin *i* is a prefix sum. O(48 x 2048) exponentials per
+  frame becomes O(2048). 1.62 s of a 2.39 s encode became 0.024 s, and the encoder is now
+  ~0.61 s for 15 s of `cam` (24.7x realtime) from 2.39 s.
+
+  Two things about that are worth writing down, because both were surprising.
+
+  **Batching alone was a loss.** Running the *same* matrix model over a stack of frames
+  instead of frame-by-frame made it 20% *slower*: the batched form touches 353x2048
+  intermediates that leave L1 and get reallocated per call, while the loop keeps a
+  2048-wide working set hot. Vectorizing is not the same as optimizing, and the algorithmic
+  form, not the loop order, is what bought the speed.
+
+  **Self-masking must be excluded, not subtracted.** The first version summed every masker
+  including the bin itself and subtracted afterwards. That is the same algebra and a
+  numerically terrible one: at a loud bin the two numbers agree to ~16 decades, so the
+  answer is cancellation residue. It showed up as a 1.2e-2 dB drift off an explicit
+  per-masker loop, and once, on one file, one flipped coefficient. Using *exclusive* prefix
+  sums - maskers strictly below and strictly above, never the bin itself - drops that to
+  5.6e-8 dB and removes the flip. The lesson generalises: the two forms disagree by up to
+  113 dB in raw mask dB, and all 23 disagreeing bins of 722,944 are **below ATH**, where
+  `max(mask, ATH)` overwrites them, so the codec never sees the difference. A raw-threshold
+  diff that big between two implementations of one model is a scale artifact, not a bug, but
+  only because it hides under the ATH floor - which is exactly why the gate is the bit map
+  and not the threshold.
 
 - **No format, no decoder.** Nothing here is serializable yet. RSC2 v3 (`../rsc2_testing_lab`)
   is the shipping codec until this has a container and a Luau decoder.
