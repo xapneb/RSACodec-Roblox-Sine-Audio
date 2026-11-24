@@ -125,21 +125,38 @@ def decode(data: bytes):
     if note != "flat":
         print(f"   ⚠️  {note}")
 
-    stride  = codec.frame_stride(h["max_partials"])
+    stride  = codec.frame_stride(h["max_partials"], h["version"])
     start   = codec.data_start()
     total   = (h["n_frames"] - 1) * hop_size + fft_size
     pcm_out = np.zeros((total, h["channels"]), dtype=np.float32)
 
+    packed = h["version"] >= 3
+    if packed:
+        bin_bits, amp_bits = codec.pack_bits(fft_size)
+        bin_mask = (1 << bin_bits) - 1
+        amp_mask = (1 << amp_bits) - 1
+
     for ch in range(h["channels"]):
         block = data[start + ch * h["n_frames"] * stride:]
-        rec = np.frombuffer(block, dtype="<u2",
-                            count=h["n_frames"] * (stride // 2)).reshape(h["n_frames"],
-                                                                        stride // 2)
-
-        peak   = np.ascontiguousarray(rec[:, 0:2]).view("<f4").astype(np.float64).reshape(-1)
-        bins   = rec[:, 3::3].astype(np.int64)
-        amp_u  = rec[:, 4::3].astype(np.float64) / codec._U16_MAX
-        phase  = rec[:, 5::3].astype(np.float64) * (_TWO_PI / codec._U16_MAX) - np.pi
+        if packed:
+            rec = np.frombuffer(block, dtype=np.uint8,
+                                count=h["n_frames"] * stride).reshape(h["n_frames"], stride)
+            peak = rec[:, 0:4].copy().view("<f4").astype(np.float64).reshape(-1)
+            packed3 = (rec[:, 6::5].astype(np.uint32)
+                       | (rec[:, 7::5].astype(np.uint32) << 8)
+                       | (rec[:, 8::5].astype(np.uint32) << 16))
+            bins  = (packed3 & bin_mask).astype(np.int64)
+            amp_u = ((packed3 >> bin_bits) & amp_mask).astype(np.float64) / amp_mask
+            ph_u  = rec[:, 9::5].astype(np.uint32) | (rec[:, 10::5].astype(np.uint32) << 8)
+            phase = ph_u.astype(np.float64) * (_TWO_PI / codec._U16_MAX) - np.pi
+        else:
+            rec = np.frombuffer(block, dtype="<u2",
+                                count=h["n_frames"] * (stride // 2)).reshape(h["n_frames"],
+                                                                            stride // 2)
+            peak  = np.ascontiguousarray(rec[:, 0:2]).view("<f4").astype(np.float64).reshape(-1)
+            bins  = rec[:, 3::3].astype(np.int64)
+            amp_u = rec[:, 4::3].astype(np.float64) / codec._U16_MAX
+            phase = rec[:, 5::3].astype(np.float64) * (_TWO_PI / codec._U16_MAX) - np.pi
 
         # peak * amp_u16/65535 is the frame's rfft magnitude at that bin; amplitude_scale
         # unwraps the half-tone convention and window_sum undoes the analysis window gain.

@@ -149,6 +149,123 @@ Two things to watch in that engine:
   24 per frame per channel, so around 2.3M steps a second, and a table lookup instead of `math.sin`
   is what makes that affordable in Luau.
 
+## v3: packed frame layout
+
+v2 spent 6 bytes per partial on three words: bin, amplitude, phase. That is mostly wasted. The
+bin index only ever needs `ceil(log2(fft/2))` bits and the amplitude is relative to the frame peak,
+so v3 keeps what the format actually needs and drops what it does not:
+
+- A frame header of peak (f32) and n_partials (u16), unchanged from v2.
+- Per partial, **five bytes** instead of six: a 24-bit word packing `bin` in the low bits and the
+  amplitude above it, then the phase as a u16. Silent slots are the all-zero word, which replaces
+  v1/v2's "point a dead slot at bin 1" trick.
+
+The phase keeps all sixteen bits and the same `(-pi, pi]` grid v2 used, and that is deliberate: the
+fidelity budget belongs to phase, not size. A shorter phase field was tried and measured
+**-44 dB** of added noise on real audio, because overlap-add rebuilds a partial from two frames
+whose phases have to line up. Sixteen bits lands at -87 dB, effectively the v2 floor.
+
+Amplitude, being relative, shrinks for free. At the default `fft_size` the 24-bit word leaves 13
+or 14 bits for amplitude, around -78 dB — under anything the analysis itself contributes. A
+larger `fft_size` shifts bits from amplitude to bin index; `pack_bits` refuses to pack below
+12 amplitude bits so it can never quietly degrade.
+
+Measured on the lab `audio.wav`:
+
+| config | v2 | v3 | ratio |
+|---|---|---|---|
+| `fft=1024 hop=512 max_partials=192` | 49.98 MB | 41.69 MB | 0.83 |
+| `fft=2048 hop=1024 max_partials=24` | 3.24 MB | 2.72 MB | 0.84 |
+
+Decode differences are the amplitude grid and nothing else: worst sample delta about 1e-4, the
+numpy model and the engines agree to well under a tenth of a percent. v3 decoders read v2 files
+and v2 decoders read v3 files, picked from the header version byte, so old `.rsc2` still plays.
+
+## Psychoacoustic partial selection
+
+v2 selection ranked bins purely by spectral salience: peakiness times magnitude. That is blind in
+two ways. It spends slots on partials that sit below the absolute threshold of hearing, and it
+cannot see that a partial 3 dB below a louder neighbour in the same critical band is not
+audible at all. The psychoacoustic layer replaces "which bins look like peaks" with "which bins
+are worth an ear", and is the default now; `--no-psy` brings back the old selection byte for byte.
+
+The model has three parts, all on the ERB scale (Glasberg-Moore), because the Bark approximations
+go wrong in the low- and high-frequency corners:
+
+- **Absolute threshold of hearing.** A rough ISO-226 curve, referenced so 0 dBFS is `spl_ref_db`
+  (default 96 dB SPL, i.e. loud 16-bit material). Anything under it is not a partial, it is silence.
+- **Simultaneous masking.** Tone maskers spread linearly in ERB-rate, -10 dB/ERB upward and
+  -25 dB/ERB downward, the Glasberg-Moore pattern. The thresholds of a whole block of frames are
+  one vectorised pair of prefix scans; per-frame masks are one maximum-each update.
+- **Temporal hysteresis.** A partial that is playing survives sinking 6 dB below threshold, so
+  notes do not flicker across frame joins. This is a click question more than a quality question:
+  the previous failure mode was selection appearing and vanishing at every frame boundary.
+
+The selection is greedy and self-consistent, which is the part that actually took the work. The
+first attempt computed the mask threshold from every peak in the full spectrum, which is what a
+transform codec does when it can mask hundreds of lines. With a 24-slot budget that is fiction:
+the maskers themselves did not fit, so partials vanished behind shadows cast by tones that were
+never encoded, and ES fell **9 dB**. Now the encoder fills its slots one at a time, loud peaks
+first, and each accepted partial is what raises the threshold the rest must clear. A dropped
+partial is therefore provably hidden behind something that plays.
+
+Then a second, quieter bug. Hysteresis kept last frame's bin alive, and this frame's salience
+pass happily voiced the bin next to it: one note that had drifted a single bin, played twice at
+full amplitude, in 682 frames. Loudness of decoded audio went above unity and every band lost
+8 dB. The kept note and the new peak are now a handoff, never a duet.
+
+Measured on `audio.wav`, 25 s, fft=2048 hop=1024, one channel:
+
+| config | salience ES | psycho ES | wasted slots (below-mask partials) |
+|---|---|---|---|
+| `max_partials=24` | 14.1 dB | 12.1 dB | 15.9% dropped, 0.3% audibly so |
+| `max_partials=16` | 9.2 dB | 10.7 dB | - |
+| `max_partials=12` | 7.6 dB | 9.3 dB | - |
+| `max_partials=8`  | 6.1 dB | 7.5 dB | - |
+
+At the full budget the psycho codec spends ~16% fewer partials for what an equal-loudness model
+rates as a ~1 dB-worse residual, and at tight budgets it wins outright, which is exactly where
+slot pressure hurts: the slots it frees go to things the model cannot shadow. Raw ES is the wrong
+unit here — masked energy is worth ~0 dB of hearing, which is the whole idea. On the synthetic
+click material it is neutral (12.7 vs 12.8 dB) and still adds zero frame-boundary spikes.
+
+Analysis runs ~6x the per-frame greedy loop (0.16 s → 0.93 s per 25 s), which stays far under the
+FFT and packing time on real files. Parameters live in `PSY_PARAMS`: slopes, the SPL reference,
+the hysteresis window, and the ranking (`level`, loud-first, is default).
+
+## Output headroom
+
+Sine atoms cannot land on a flat top, so they ring past it. On hard-limited material that ringing
+is what you hear as clicking: `audio.wav` decodes to a peak of **+3.1 dBFS** with 0.05% of samples
+over full scale, and `cam.wav` (which arrives already welded to the rail, 2,988 runs of 4+ samples
+at exactly -1.0) reaches **+5.6 dBFS** and 1.5%. Either value is enough for the client's
+`math.clamp` to flatten the top of a waveform, and a flat top that snaps back is a transient.
+
+The overshoot is linear in level, which is what makes an encoder-side gain the right lever: a
+6 dB-quieter input overshoots by exactly the same factor. So the encoder now measures it instead
+of assuming a constant, because the ratio is as much the material's as the codec's.
+
+```
+uv run python rsc_encoder.py input.wav output.rsc2          # two-pass, automatic
+uv run python rsc_encoder.py input.wav output.rsc2 --ceiling 0 # one pass, no gain
+```
+
+Pass one encodes and decodes it; if the decoded peak is above `--ceiling` (default 1.0) the
+second pass multiplies the **frame peak** by `ceiling/peak`. `decode` returns un-clamped float,
+which is why that measurement is exact. The gain is folded into the peak at pack time rather
+than into the samples before analysis, for one important reason: the psychoacoustic gates read
+absolute dBFS, so scaling the input would quietly drop the quiet partials that the threshold
+gate would otherwise keep. Applied after selection, the partial list, its amplitudes and its
+phases are untouched, and only the frame peak bytes change. Verified: same byte length, 69,640
+of the changed bytes are all peak-f32 bytes with zero inside the header, `|y2 - g*y1|` peaks at
+1.2e-07 — the f32 rounding grid of the peak value itself — and the re-encoded file decodes to
+1.00000 where the first pass decoded to 1.42899, taking samples over full scale from 0.048% to
+zero.
+
+`rscd_encoder.py` folds the same factor into its `"peak"` field and takes `--gain`, since the
+JSON path has no decoder to measure against. The value is whatever `rsc_encoder.py` measured on
+the same file: both encoders share `analyse_channel`, so the ratio carries over.
+
 ## Files
 
 - `rsc2_codec.py`: format, window, scoring, selection. One copy now, was three.

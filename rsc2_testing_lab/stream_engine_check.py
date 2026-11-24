@@ -22,28 +22,42 @@ AMP_EPS = 1e-5
 
 
 def read_frames(data):
-    """Header plus per-channel (bins, amps, phases) arrays, read straight off the frame layout."""
+    """Header plus per-channel (bins, amps, phases) arrays, read straight off the frame layout.
+    v2 stores each partial as three u16 words; v3 interleaves a 3-byte bin+amplitude word with
+    a u16 phase per record (see rsc2_codec.pack_bits), so v3 is read as byte columns."""
     h = codec.decode_header(data)
-    stride = codec.frame_stride(h["max_partials"])
+    stride = codec.frame_stride(h["max_partials"], h["version"])
     start  = codec.data_start()
-
-    part = np.dtype([("bin", "<u2"), ("amp", "<u2"), ("phase", "<u2")])
-    rec  = np.dtype([("peak", "<f4"), ("npart", "<u2"), ("parts", part, (h["max_partials"],))])
-    assert rec.itemsize == stride, (rec.itemsize, stride)
-
     nyquist = h["fft_size"] // 2
+
     chans = []
     for ch in range(h["channels"]):
-        block = np.frombuffer(data[start + ch * h["n_frames"] * stride:
-                                   start + (ch + 1) * h["n_frames"] * stride], dtype=rec)
-        peak  = block["peak"].astype(np.float64)[:, None]
-        bins  = block["parts"]["bin"].astype(np.int32)
-        rel   = block["parts"]["amp"].astype(np.float64) / 65535.0
-        phase = block["parts"]["phase"].astype(np.float64)
+        block = data[start + ch * h["n_frames"] * stride:
+                     start + (ch + 1) * h["n_frames"] * stride]
+        if h["version"] >= 3:
+            bin_bits, amp_bits = codec.pack_bits(h["fft_size"])
+            amp_mask = (1 << amp_bits) - 1
+            rec = np.frombuffer(block, np.uint8,
+                                count=h["n_frames"] * stride).reshape(h["n_frames"], stride)
+            peak = rec[:, 0:4].copy().view("<f4").astype(np.float64).reshape(-1)[:, None]
+            packed = (rec[:, 6::5].astype(np.uint32)
+                      | (rec[:, 7::5].astype(np.uint32) << 8)
+                      | (rec[:, 8::5].astype(np.uint32) << 16))
+            bins = (packed & ((1 << bin_bits) - 1)).astype(np.int32)
+            rel = ((packed >> bin_bits) & amp_mask).astype(np.float64) / amp_mask
+            ph  = (rec[:, 9::5].astype(np.float64) + rec[:, 10::5].astype(np.float64) * 256.0)
+            ph = ph / 65535.0 * 2 * np.pi - np.pi
+        else:
+            rec = np.frombuffer(block, "<u2",
+                                count=h["n_frames"] * (stride // 2)).reshape(h["n_frames"],
+                                                                            stride // 2)
+            peak = np.ascontiguousarray(rec[:, 0:2]).view("<f4").astype(np.float64).reshape(-1)[:, None]
+            bins = rec[:, 3::3].astype(np.int32)
+            rel = rec[:, 4::3].astype(np.float64) / 65535.0
+            ph = rec[:, 5::3].astype(np.float64) / 65535.0 * 2 * np.pi - np.pi
 
         scale = np.where((bins > 0) & (bins < nyquist), 2.0, 1.0)
-        amp   = rel * peak * scale / h["window_sum"]
-        ph    = (phase / 65535.0) * 2 * np.pi - np.pi
+        amp = rel * peak * scale / h["window_sum"]
         chans.append((bins, amp, ph, h))
     return chans
 

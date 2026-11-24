@@ -67,6 +67,15 @@ local function readU32LE(data, off)
 	)
 end
 
+-- v3 packs bin+amplitude into three bytes, so the record reads a u24 then a u16 phase.
+local function readU24LE(data, off)
+	return bit32.bor(
+		string.byte(data, off),
+		bit32.lshift(string.byte(data, off + 1), 8),
+		bit32.lshift(string.byte(data, off + 2), 16)
+	)
+end
+
 local function readF32LE(data, off)
 	local bits = bit32.bor(
 		string.byte(data, off),
@@ -111,6 +120,28 @@ local function eachPartial(dec, frameIdx, ch, fn)
 	local off = dec.frameBase + ((ch - 1) * dec.nFrames + frameIdx) * dec.frameStride
 	local peak  = readF32LE(dec.data, off)
 	local nPart = readU16LE(dec.data, off + 4)
+
+	if dec.pack then
+		-- v3: bin+amplitude live in a 24-bit word, phase is a u16 after it. Every surviving
+		-- bin is 0 < bin < nyquist, so the half-bin scale is always 2.
+		local scaleC = 2 * peak / (dec.ampMask * dec.windowSum)
+		local p = off + 6
+		for _ = 1, nPart do
+			local word = readU24LE(dec.data, p)
+			if word ~= 0 then
+				local bin = bit32.band(word, dec.binMask)
+				if bin > 0 and bin < dec.nyquist then
+					local amp = bit32.band(bit32.rshift(word, dec.binBits), dec.ampMask) * scaleC
+					if amp > AMP_EPS then
+						local phase = (readU16LE(dec.data, p + 3) / 65535) * TAU - math.pi
+						fn(bin, bin * dec.binHz, amp, phase)
+					end
+				end
+			end
+			p = p + 5
+		end
+		return
+	end
 
 	local p = off + 6
 	for _ = 1, nPart do
@@ -174,6 +205,12 @@ function StreamEngine.tryNew(dec)
 	self.clips       = 0
 	self.shortWrites = 0
 	self.sumBuf      = table.create(dec.hopSize)  -- scratch for the partial-outer render
+	self.seenGen     = 0                          -- generation stamp so applyFrame never clears seen
+	self.pairW       = tcreate(math.max(16, dec.maxPartials)) -- steady-pair scratch
+	self.pairC1      = tcreate(math.max(16, dec.maxPartials))
+	self.pairC0      = tcreate(math.max(16, dec.maxPartials))
+	self.buffers     = nil                        -- write buffers, rebuilt only when the size changes
+	self.bufN        = 0
 
 	local setup = pcall(function()
 		if self.channels == 2 then
@@ -269,39 +306,93 @@ end
 
 -- Pulls one frame into the slot register: new bins arrive at gain 0 and ramp in, missing bins
 -- leave at a ramp instead of being cut.
+--
+-- Parses the frame records directly instead of going through eachPartial, because this callback
+-- runs for every partial of every frame and the closure churn is visible at 47 frames per second.
+-- Slots carry their own recurrence coefficient w, and existing slots skip the phase bytes.
 function StreamEngine:applyFrame(ch, frameIdx)
-	local reg  = self.reg[ch]
+	local dec = self.dec
+	local reg = self.reg[ch]
 	local seen = self.seenScratch
 
 	if seen == nil then
 		seen = {}
 		self.seenScratch = seen
 	end
-	for k in pairs(seen) do
-		seen[k] = nil
-	end
+	local gen = self.seenGen + 1
+	self.seenGen = gen
 
-	local self_, fft = self, self.fft
-	eachPartial(self.dec, frameIdx, ch, function(bin, freq, amp, phase)
-		local slot = reg[bin]
-		if slot == nil then
-			slot = {
-				bin    = bin,
-				inc    = bin / fft,           -- turns per sample, so freq is exactly bin * binHz
-				amp    = 0,
-				target = amp,
-				ph     = (phase / TAU) % 1,   -- seeded once; after that phase only accumulates
-			}
-			reg[bin] = slot
-		else
-			slot.target = amp
+	local fft   = self.fft
+	local nyq   = dec.nyquist
+	local data  = dec.data
+	local off   = dec.frameBase + ((ch - 1) * dec.nFrames + frameIdx) * dec.frameStride
+	local peak  = readF32LE(data, off)
+	local nPart = readU16LE(data, off + 4)
+	-- every surviving bin is in 0 < bin < nyquist, so the half-bin scale is always 2
+	local ampMax  = dec.ampMask
+	local scaleC  = 2 * peak / (ampMax * dec.windowSum)
+
+	local p = off + 6
+	if dec.pack then
+		for _ = 1, nPart do
+			local word = readU24LE(data, p)
+			if word ~= 0 then
+				local bin = bit32.band(word, dec.binMask)
+				if bin > 0 and bin < nyq then
+					local amp  = bit32.band(bit32.rshift(word, dec.binBits), ampMax) * scaleC
+					local slot = amp > AMP_EPS and reg[bin] or nil
+					if amp > AMP_EPS and slot == nil then
+						slot = {
+							bin    = bin,
+							inc    = bin / fft,               -- turns per sample, so freq is exactly bin * binHz
+							w      = 2 * math.cos(TAU * (bin / fft)), -- recurrence coefficient, used every hop
+							amp    = 0,
+							target = amp,
+							ph     = (readU16LE(data, p + 3) / 65535 - 0.5) % 1, -- seeded once; after that phase only accumulates
+						}
+						reg[bin] = slot
+					elseif slot ~= nil then
+						slot.target = amp
+					end
+					if slot ~= nil then
+						seen[slot] = gen
+					end
+				end
+			end
+			p = p + 5
 		end
-		seen[slot] = true
-	end)
+	else
+		for _ = 1, nPart do
+			local bin  = readU16LE(data, p)
+			local ampU = readU16LE(data, p + 2)
+			if bin > 0 and bin < nyq then
+				local amp  = ampU * scaleC
+				local slot = amp > AMP_EPS and reg[bin] or nil
+				if amp > AMP_EPS and slot == nil then
+					local phU = readU16LE(data, p + 4)
+					slot = {
+						bin    = bin,
+						inc    = bin / fft,               -- turns per sample, so freq is exactly bin * binHz
+						w      = 2 * math.cos(TAU * (bin / fft)), -- recurrence coefficient, used every hop
+						amp    = 0,
+						target = amp,
+						ph     = (phU / 65535 - 0.5) % 1, -- seeded once; after that phase only accumulates
+					}
+					reg[bin] = slot
+				elseif slot ~= nil then
+					slot.target = amp
+				end
+				if slot ~= nil then
+					seen[slot] = gen
+				end
+			end
+			p = p + 6
+		end
+	end
 
 	local list, n = self.list[ch], 0
 	for bin, slot in pairs(reg) do
-		if seen[slot] == nil then
+		if seen[slot] ~= gen then
 			slot.target = 0
 		end
 		if slot.target > 0 or slot.amp > AMP_EPS then
@@ -309,6 +400,7 @@ function StreamEngine:applyFrame(ch, frameIdx)
 			list[n] = slot
 		else
 			reg[bin] = nil
+			seen[slot] = nil       -- forget the stamp too, so seen never grows past reg
 		end
 	end
 	for i = #list, n + 1, -1 do
@@ -319,69 +411,174 @@ end
 -- Renders `frames` samples per channel straight into Float32 buffers.
 function StreamEngine:render(frames)
 	local dec, hop = self.dec, self.hop
-	local rampK, SIN_TAB = self.rampK, SIN
+	local rampK    = self.rampK
 	local pos, clips = self.pos, self.clips
+	local channels = self.channels
 
-	local buffers = tcreate(self.channels)
-	for ch = 1, self.channels do
-		buffers[ch] = buffer.create(frames * 4)
+	-- Write buffers only get rebuilt when the requested size changes, which is rare in the
+	-- steady state: the ring buffer wants the same chunk from tick to tick.
+	local buffers = self.buffers
+	if buffers == nil or self.bufN ~= frames then
+		buffers = tcreate(channels)
+		for ch = 1, channels do
+			buffers[ch] = buffer.create(frames * 4)
+		end
+		self.buffers = buffers
+		self.bufN    = frames
 	end
 
-	local done = 0
+	local sumBuf = self.sumBuf
+	local done   = 0
 	while done < frames do
 		local frameIdx = floor(pos / hop)
 		if frameIdx >= dec.nFrames then
 			frameIdx = dec.nFrames - 1
 		end
-		for ch = 1, self.channels do
+		for ch = 1, channels do
 			if self.applied[ch] ~= frameIdx then
 				self.applied[ch] = frameIdx
 				self:applyFrame(ch, frameIdx)
 			end
 		end
 
-		local seg = math.min(frames - done, hop - (pos % hop))
+		local seg  = hop - (pos % hop)
+		local rest = frames - done
+		if rest < seg then
+			seg = rest
+		end
 
-		for ch = 1, self.channels do
+		for ch = 1, channels do
 			local list  = self.list[ch]
 			local count = #list
 			local buf   = buffers[ch]
 			local base  = done * 4
-			local sumBuf = self.sumBuf
 
-			for k = 1, seg do
-				sumBuf[k] = 0
-			end
-
-			-- One 3-term recurrence roll per partial instead of floor + two table reads
-			-- per sample: s(m+1) = 2 cos(w) s(m) - s(m-1). Seeded from the wavetable once
-			-- per hop, so drift re-seeds before it can accumulate.
-			for j = 1, count do
-				local s   = list[j]
-				local inc = s.inc
-				local ph  = s.ph
-				local b1  = math.sin((ph + inc) * TAU)
-				local b0  = math.sin(ph * TAU)
-				local w   = 2 * math.cos(TAU * inc)
-				local amp, target = s.amp, s.target
+			if count == 0 then
+				-- nothing sounding here: write silence natively, no Lua loop
+				buffer.fill(buf, base, seg * 4, 0)
+			else
 				for k = 1, seg do
-					amp = amp + (target - amp) * rampK
-					sumBuf[k] = sumBuf[k] + amp * b1
-					local nb = w * b1 - b0
-					b0, b1 = b1, nb
+					sumBuf[k] = 0
 				end
-				s.ph  = (ph + inc * seg) % 1
-				s.amp = amp
-			end
 
-			for k = 1, seg do
-				local sum = sumBuf[k]
-				if sum > 1 then
-					sum, clips = 1, clips + 1
-				elseif sum < -1 then
-					sum, clips = -1, clips + 1
+				-- Two inner-loop shapes, chosen by how many partials are steady (amp ==
+				-- target, the common case for held notes).
+				--
+				-- Paired mode: two recurrence rolls share one read-modify-write of
+				-- sumBuf, which is the expensive part, not the flops. The roll itself is
+				-- unchanged (s(m+1) = 2 cos(w) s(m) - s(m-1), seeded from the wavetable
+				-- once per segment so drift re-seeds before it can accumulate); pairing
+				-- just interleaves two independent streams.
+				--
+				-- Folded mode: partial one at a time, amplitude folded into the roll.
+				-- The pair scratch is only worth filling when at least a couple of pairs
+				-- exist, so the count decides once per segment.
+				local ws, xs, zs = self.pairW, self.pairC1, self.pairC0
+				local ns = 0
+				for j = 1, count do
+					local s = list[j]
+					if s.amp == s.target then
+						ns = ns + 1
+					end
 				end
-				buffer.writef32(buf, base + (k - 1) * 4, sum)
+
+				if ns * 2 > count then
+					ns = 0
+					for j = 1, count do
+						local s   = list[j]
+						local inc = s.inc
+						local ph  = s.ph
+						local b1  = math.sin((ph + inc) * TAU)
+						local b0  = math.sin(ph * TAU)
+						local amp, target = s.amp, s.target
+						if amp == target then
+							ns = ns + 1
+							ws[ns] = s.w
+							xs[ns] = amp * b1
+							zs[ns] = amp * b0
+						else
+							local w = s.w
+							for k = 1, seg do
+								amp = amp + (target - amp) * rampK
+								sumBuf[k] = sumBuf[k] + amp * b1
+								local nb = w * b1 - b0
+								b0, b1 = b1, nb
+							end
+							if amp + (target - amp) * rampK == amp then
+								amp = target -- converged; next segment folds/pairs instead
+							end
+							s.amp = amp
+						end
+						s.ph = (ph + inc * seg) % 1
+					end
+
+					local j = 1
+					while j + 1 <= ns do
+						local w1, b1, b0 = ws[j], xs[j], zs[j]
+						local w2, d1, d0 = ws[j + 1], xs[j + 1], zs[j + 1]
+						for k = 1, seg do
+							sumBuf[k] = sumBuf[k] + b1 + d1
+							local n1 = w1 * b1 - b0
+							local n2 = w2 * d1 - d0
+							b0, b1 = b1, n1
+							d0, d1 = d1, n2
+						end
+						j = j + 2
+					end
+					if j <= ns then
+						local w1, b1, b0 = ws[j], xs[j], zs[j]
+						for k = 1, seg do
+							sumBuf[k] = sumBuf[k] + b1
+							local nb = w1 * b1 - b0
+							b0, b1 = b1, nb
+						end
+					end
+				else
+					for j = 1, count do
+						local s     = list[j]
+						local inc   = s.inc
+						local ph    = s.ph
+						local w     = s.w
+						local b1    = math.sin((ph + inc) * TAU)
+						local b0    = math.sin(ph * TAU)
+						local amp, target = s.amp, s.target
+
+						if amp == target then
+							local c1 = amp * b1
+							local c0 = amp * b0
+							for k = 1, seg do
+								sumBuf[k] = sumBuf[k] + c1
+								local nb = w * c1 - c0
+								c0, c1 = c1, nb
+							end
+						else
+							for k = 1, seg do
+								amp = amp + (target - amp) * rampK
+								sumBuf[k] = sumBuf[k] + amp * b1
+								local nb = w * b1 - b0
+								b0, b1 = b1, nb
+							end
+							if amp + (target - amp) * rampK == amp then
+								amp = target -- converged; next segment folds/pairs instead
+							end
+							s.amp = amp
+						end
+
+						s.ph = (ph + inc * seg) % 1
+					end
+				end
+
+				local k = 1
+				for off = base, base + seg * 4 - 4, 4 do
+					local sum = sumBuf[k]
+					if sum > 1 then
+						sum, clips = 1, clips + 1
+					elseif sum < -1 then
+						sum, clips = -1, clips + 1
+					end
+					buffer.writef32(buf, off, sum)
+					k = k + 1
+				end
 			end
 		end
 
@@ -425,7 +622,9 @@ function StreamEngine:tick(dt)
 	local spin = SPIN_MAX
 	while need > 0 and spin > 0 do
 		local space
-		local ok, res = pcall(function() return self.writer:Space() end)
+		-- Method, not closure: the spin loop runs up to SPIN_MAX times per tick and an
+		-- allocating closure each time is churn for nothing.
+		local ok, res = pcall(self.writer.Space, self.writer)
 		if not ok then
 			self:fail(res)
 			return
@@ -438,7 +637,7 @@ function StreamEngine:tick(dt)
 		end
 
 		local buffers  = self:render(n)
-		local ok2, got = pcall(function() return self.writer:Write(buffers) end)
+		local ok2, got = pcall(self.writer.Write, self.writer, buffers)
 		if not ok2 then
 			self:fail(got)
 			return
@@ -707,8 +906,30 @@ function RSC2.new(rscData)
 	self.binHz       = self.sampleRate / self.fftSize
 	self.nyquist     = math.floor(self.fftSize / 2)
 	self.frameBase   = 4 + 24 + 1                 -- 4 magic + 24 header, 1-based
-	self.frameStride = 6 + self.maxPartials * 6
-	self.duration    = self.nFrames * self.hopSec
+	if self.version >= 3 then
+		-- v3 packs each partial into five bytes: three bytes of [amplitude | bin] with the
+		-- smallest bin width that holds this fft, then a u16 phase on v2's exact grid. Silent
+		-- slots are the 5-byte word 0; bin 0 is never selectable, so they skip free.
+		local binBits = 0
+		local n = self.nyquist - 1
+		while n > 0 do
+			binBits = binBits + 1
+			n = n // 2
+		end
+		if binBits < 1 then
+			binBits = 1
+		end
+		self.pack        = true
+		self.binBits     = binBits
+		self.binMask     = bit32.lshift(1, binBits) - 1
+		self.ampMask     = bit32.lshift(1, 24 - binBits) - 1
+		self.frameStride = 6 + self.maxPartials * 5
+	else
+		self.pack        = false
+		self.ampMask     = 65535
+		self.frameStride = 6 + self.maxPartials * 6
+	end
+	self.duration = self.nFrames * self.hopSec
 
 	print(string.format("[RSC2] v%d | %d Hz | %d ch | %d frames | fft=%d hop=%d | %.2f s",
 		self.version, self.sampleRate, self.channels, self.nFrames,
@@ -877,13 +1098,20 @@ local function main()
 	end
 
 	local _, info = createGUI(decoder)
+	-- The text label only needs to be readable, not perfect: formatting it every frame is
+	-- string allocation at 60+ Hz for a number nobody watches that closely.
+	local infoTick = 1
 	RunService.Heartbeat:Connect(function(dt)
 		decoder:tick(dt)
-		local e = decoder.engine
-		info.Text = string.format(
-			"%.2f / %.2f s   %s\npartials %d   clipped samples %d",
-			decoder:currentSecond(), decoder.duration, e.name,
-			e:partialCount(), e.clips or 0)
+		infoTick = infoTick + dt
+		if infoTick >= 0.25 then
+			infoTick = 0
+			local e = decoder.engine
+			info.Text = string.format(
+				"%.2f / %.2f s   %s\npartials %d   clipped samples %d",
+				decoder:currentSecond(), decoder.duration, e.name,
+				e:partialCount(), e.clips or 0)
+		end
 	end)
 end
 

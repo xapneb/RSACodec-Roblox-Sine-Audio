@@ -34,7 +34,7 @@ import rsc2_codec as codec
 
 def encode_json(pcm: np.ndarray, sample_rate: int, fft_size: int, hop_size: int,
                 max_partials: int, block: int = codec.ANALYSIS_BLOCK,
-                max_frames: int = None) -> dict:
+                max_frames: int = None, gain: float = 1.0) -> dict:
     if pcm.ndim == 1:
         pcm = pcm[:, None]
     if max_frames is not None:                       # stop before analysing what we will drop
@@ -52,7 +52,8 @@ def encode_json(pcm: np.ndarray, sample_rate: int, fft_size: int, hop_size: int,
         n_frames = bins.shape[0] if n_frames is None else min(n_frames, bins.shape[0])
         peak_safe = np.where(peak > 1e-12, peak, 1.0)
         rel = np.where(peak[:, None] > 1e-12, mags / peak_safe[:, None], 0.0)
-        peak_abs = peak * 2.0 / window_sum
+        peak_abs = peak * 2.0 / window_sum * gain   # headroom, applied after selection so the
+        # partial list and phases stay identical to a gain=1 encode (synthesis is linear)
 
         frames = []
         for i in range(n_frames):
@@ -100,6 +101,11 @@ def main():
                     help="analyse only the first N frames (Desmos expression lists are finite)")
     ap.add_argument("--analysis-block", type=int, default=codec.ANALYSIS_BLOCK,
                     help="frames in flight; lower it if you are memory constrained")
+    ap.add_argument("--gain", type=float, default=1.0,
+                    help="linear headroom gain folded into the frame peak; applied after "
+                         "partial selection so nothing is dropped or moved, and the "
+                         "measured value for a file can be read off rsc_encoder.py's two-pass "
+                         "(the two encoders share the analysis)")
     a = ap.parse_args()
 
     print(f"🎵 {a.input}")
