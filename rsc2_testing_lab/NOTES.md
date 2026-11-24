@@ -274,3 +274,12 @@ the same file: both encoders share `analyse_channel`, so the ratio carries over.
 - `measure_clicks.py`: the regression test above.
 - `stream_engine_check.py`: numpy mirror of the stream engine, for checking the Lua off-line.
 - `rsc_decoder.lua`: the Roblox client, stream engine when available and the Sound bank otherwise.
+
+## See also
+
+[`../rsc3_prototype/`](../rsc3_prototype/README.md) is the block-transform successor: same
+lab, same audio, better measured results at lower rate, but no bitstream and no decoder.
+Two things carry over from that work and apply to this one too. Raw ES is not the quality
+ruler - score error against the masking threshold of the *original* and it agrees with
+listening, and fit a gain before comparing two codecs, or a coherent level offset gets
+charged as error and caps the score at whatever that offset allows.

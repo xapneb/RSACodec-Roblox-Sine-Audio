@@ -1,0 +1,87 @@
+# RSC3 prototype
+
+Block-transform codec: fast MDCT, uniform scalefactor bands, reverse-waterfill bit
+allocation against a psychoacoustic threshold model. It is the successor to the RSC2
+additive-synthesis line, and it is **not finished**: it encodes, it measures, and it
+produces listening files, but it has no bitstream and no decoder.
+
+```
+rsc3_codec.py         model core - transform, thresholds, allocation, quantiser
+transform_check.py    the transform's own proof: kernel match + full-signal OLA
+ab_codec.py           A/B generator, the protocol that produces every listening file
+gainfit_es.py         re-scores any file under a fitted gain (see "Rulers")
+audible_sweep.py      quality vs budget, scored in audible-error units
+hf_audit.py           bits / signal / error / audible-error per frequency band
+fill_experiment.py    noise-fill, priced per run of dead bands, at equal bitrate
+```
+
+Run anything from this folder: `python ab_codec.py ..\\rsc2_testing_lab\\ij.wav`
+(paths resolve relative to the repo, so the scripts work wherever they're checked out).
+
+## How far along it is
+
+Everything below is measured, on this repo's own audio, at 512 bits/frame.
+
+| | |
+|---|---|
+| Transform | analysis and synthesis exact to ~1e-15 (`transform_check.py`), fold-validated against the ISO kernel, one complex FFT per block, so it is portable to Luau |
+| Scalefactor grid | 128 uniform bands of 16 bins, spanning 0-24 kHz with nothing cut off |
+| Rate | ~11.7 kbit/s per channel mantissa-only; ~12.8 with live-band side info |
+| Quality | 9.1-12.5 dB gain-fitted ES at 512 b/f, versus 3.9-7.3 dB for shipping RSC2 at mp=8 (~17 kbit/s/ch) |
+
+So the honest pitch is **5.2 dB better than RSC2, at roughly 1.4x lower rate, on both
+reference tracks**. That +5.2 dB was constant across files only once the ruler was fixed;
+before that it appeared to swing between 2.3 and 6.4 dB, which was measurement, not material.
+
+## Rulers
+
+The codec's quality is decided by two numbers and one window:
+
+1. **Gain-fitted ES.** Fit the least-squares gain, then measure what's left. Without the
+   fit, a coherent level offset is charged as error and caps ES at whatever that offset
+   allows - a pure 6 dB level loss caps ES at 6 dB even for perfect coding. Every codec
+   here loses a few dB to its own headroom, so naive ES ran ~3 dB low across the board.
+   `gainfit_es.py` prints both.
+2. **Audible error.** `sum max(0, E_bin - THR_bin)` where THR is the masking threshold of
+   the *original* signal, shared by both arms so neither is graded against its own curve.
+   This is the number that agrees with listening; raw ES is for spotting bugs.
+3. **The spectrogram, and your ears.** Both have beaten the metrics four separate times,
+   which makes them a required stage, not a formality.
+
+Two rules fall out of this and they are non-negotiable in this directory: a result that
+looks *flat* against budget is treated as a broken harness until proven otherwise, and any
+trick that costs side info is charged **inside** the budget or the comparison doesn't count.
+
+## What is settled
+
+- **The quantiser step is `2^-b`, not `2^(1-b)`.** Worth +0.45 to +0.66 dB, confirmed by
+  A/B and by falsification (`audio` 12.95/12.77/10.97 at 512/256/128 b/f, `tone` 14.52,
+  `clicks` 19.06, un-coded transform 306.97 as the sanity bound).
+- **Bins below their threshold get zero bits.** Quantising a masked bin with the coarse
+  step its bits can buy adds more noise than it hides: this is why the quiet neighbours of
+  a pure tone used to eat 96% of its residual.
+- **Psychoacoustic gating is a win**, on every track tried, by the audible ledger, even
+  where raw ES says the blind allocation wins. Level-match before trusting any listen.
+- **Upward band folding is dead.** Mirror alias is proportional to the loudest member of
+  each pair, and upward folding pairs the loudest bins (bass) with the emptiest (treble),
+  so the alias is always bass-loud. No per-frame energy correction fixes a shape error.
+- **Run-based noise fill works at equal bitrate.** Where a band is fully zeroed, the
+  decoder fills it with seeded noise at a flat floor for that contiguous run, costing
+  ~6 bits per run rather than per band: 464 mantissa + 48 fill = 512 b/f, and 16-19 kHz
+  density lands within ~1-2 dB of the source instead of -95 dB below it. It costs ~1.2 dB
+  of ES, which is expected and not a regression: matched-energy noise carries roughly
+  twice the error power of zeroing, while sounding like air instead of a hole.
+
+## What is not
+
+- **No format, no decoder.** Nothing here is serializable yet. RSC2 v3 (`../rsc2_testing_lab`)
+  is the shipping codec until this has a container and a Luau decoder.
+- **High-frequency efficiency.** Two thirds of all audible error on `cursedseptember` sits
+  in 5-10 kHz, where that band pays 1.75x its share of damage per bit, and 10-14 kHz pays
+  5.8x. Whether that's the waterfill bias, the uniform band widths, or the mask's HF slopes
+  is a decision `hf_audit.py` was written to make, not yet made.
+- **Noise fill is not yet in the core**, and the "flat floor per run is nearly free" claim
+  still has an unexplained measurement anomaly in its spread statistic.
+- **PVQ is unresolved.** At honestly-paid bits scalar quantisation beats PVQ by 7-8 dB, but
+  the loss-vs-budget curve was flat, which in this repo is a harness symptom, not a finding.
+- The model is numpy. Encoding is far too slow for real time, and the decoder does not exist.
