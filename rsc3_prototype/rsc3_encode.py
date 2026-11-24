@@ -49,29 +49,44 @@ def band_bits(A, sr, budget, psycho=True):
     return np.clip(b.astype(np.int64), 0, st.MAX_BITS)
 
 
-def encode_channel(A, sr, budget, psycho, want_cost=False):
+def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe"):
     """
     Returns (payload, recon), where recon is built by the shared reconstruct_bands - the same
     code the decoder will run - so the encoder's quality number is the decoder's, not the
     encoder's opinion of it.
+
+    fill turns the dead-band noise fill on or off, and mode says which way it is levelled. It is
+    an argument rather than a constant because it changes the sound: the encoder must measure the
+    quality of the audio it will actually deliver, and an ES measured without the fill would be
+    a claim about a file that does not exist. The words used for synthesis and the words written
+    to the payload are the same object, so that cannot come apart.
     """
     nfr, nc = A.shape
     nb = st.band_grid(nc, WIDTH)
     bits = band_bits(A, sr, budget, psycho)
     A3 = A.reshape(nfr, nb, WIDTH)
+    # The fill ceiling is a masking question, and the allocation already knows the mask, so
+    # taking the same threshold here is not extra theory - it is the same number, asked for.
+    # "mean" fill does not need it, and getting it anyway would cost a mask per frame for
+    # nothing.
+    thr3 = (r3.threshold_dbfs(20.0 * np.log10(np.maximum(np.abs(A), 1e-30)), sr, nc,
+                              psycho=psycho).reshape(nfr, nb, WIDTH)
+            if fill and mode == "safe" else None)
     recon = np.zeros((nfr, nc))
     w = st.Writer()
     prev_E = np.zeros(nb, np.int64)
     prev_b = np.zeros(nb, np.int64)
-    cost = np.zeros(3, np.int64) if want_cost else None
+    cost = np.zeros(4, np.int64) if want_cost else None
 
     for f in range(nfr):
         b = bits[f]
         E = st.band_exponents(A3[f])
         mant = st.quantise_bands(A3[f], E, b)
-        recon[f] = st.reconstruct_bands(E, b, mant).reshape(-1)
+        words = (st.run_fill_words(st.band_fill_cap(A3[f], None if thr3 is None else thr3[f]),
+                                   b, mode) if fill else None)
+        recon[f] = st.reconstruct_bands(E, b, mant, words, f, WIDTH).reshape(-1)
 
-        E, field = st.write_frame(w, E, b, mant, prev_E, prev_b, WIDTH)
+        E, field = st.write_frame(w, E, b, mant, prev_E, prev_b, WIDTH, fill=words)
         if want_cost:
             cost += np.array(field, np.int64)
         prev_E, prev_b = E, b
@@ -95,6 +110,16 @@ def main():
                     help="encode at --budget as given and report the measured rate")
     ap.add_argument("--blind", action="store_true",
                     help="disable the psychoacoustic threshold (ATH only)")
+    ap.add_argument("--fill", dest="fill", action="store_true", default=True,
+                    help="fill dead bands with level-coded noise (default, and the default rate "
+                         "the header says)")
+    ap.add_argument("--no-fill", dest="fill", action="store_false",
+                    help="leave dead bands silent: the previous bit map, byte for byte")
+    ap.add_argument("--fill-mode", choices=("safe", "mean"), default="safe",
+                    help="safe (default) levels each run as loud as ITS OWN MASK allows, so "
+                         "nothing measured is above the audibility floor; mean levels the run "
+                         "at its own energy, which is louder and airier and, measured, lands "
+                         "about one band in five above the mask")
     args = ap.parse_args()
 
     x, sr = read_wav(args.input)
@@ -118,7 +143,8 @@ def main():
         payloads, recons, costs = [], [], []
         for A in A_all:
             p, rc, cost = encode_channel(A, sr, budget, psycho=not args.blind,
-                                         want_cost=True)
+                                         want_cost=True, fill=args.fill,
+                                         mode=args.fill_mode)
             payloads.append(p)
             recons.append(rc)
             costs.append(cost)
@@ -141,7 +167,16 @@ def main():
             A3 = A.reshape(n, nb, WIDTH)
             E = np.array([st.band_exponents(A3[f]) for f in range(n)])
             M = np.array([st.quantise_bands(A3[f], E[f], bits[f]) for f in range(n)])
-            tot += float(st.frame_costs(E, bits, M, WIDTH).sum())
+            # the fill field is real bits, so the estimator that picks the budget has to charge
+            # it. A search that forgot it would understate every rate below ~16 kbit/s, which is
+            # exactly where the fill is a large share of the frame. The mask is only needed to
+            # know WHICH level goes in, not how many bits it costs, so the mean arm skips it.
+            thr = (r3.threshold_dbfs(20.0 * np.log10(np.maximum(np.abs(A), 1e-30)), sr,
+                                     A.shape[1], psycho=not args.blind)
+                   .reshape(n, nb, WIDTH)
+                   if args.fill and args.fill_mode == "safe" else None)
+            fl = st.fill_codes_all(A3, bits, thr, args.fill_mode) if args.fill else None
+            tot += float(st.frame_costs(E, bits, M, WIDTH, fill_levels=fl).sum())
         return tot / max(nsub, 1) * frate / 1000.0
 
     if args.no_search:
@@ -186,8 +221,10 @@ def main():
 
     print(f"   budget {chosen} b/f   scale {cost[0] / nfr:7.1f} b/f   "
           f"bits {cost[1] / nfr:6.1f} b/f   mantissa {cost[2] / nfr:7.1f} b/f   "
-          f"(per channel)")
-    print(f"   side info is {(cost[0] + cost[1]) / max(cost.sum(), 1) * 100:.0f}% of the file")
+          f"fill {cost[3] / nfr:5.1f} b/f   (per channel)")
+    print(f"   side info is {(cost[0] + cost[1] + cost[3]) / max(cost.sum(), 1) * 100:.0f}%"
+          f" of the file   dead-band fill "
+          f"{'on' if args.fill else 'OFF, silence where the source had something'}")
     # The fields must add up to the bytes. Attributed bits can only differ from the file by
     # the final byte-flush padding, so a drift over 7 bits means a field went unwritten, or
     # read twice, and no rate number printed below is worth quoting.
@@ -201,7 +238,8 @@ def main():
         bias = (kbps / nch) / max(est, 1e-9) - 1.0
         print(f"   probe-frame estimate {est:7.2f} kbit/s   measured {kbps / nch:7.2f}"
               f"   bias {bias * 100:+5.1f}%")
-    h = st.pack_header(sr, nch, N2, WIDTH, n_samp, chosen, [len(p) for p in payloads])
+    h = st.pack_header(sr, nch, N2, WIDTH, n_samp, chosen, [len(p) for p in payloads],
+                       flags=st.FILL_FLAG if args.fill else 0)
     with open(out, "wb") as f:
         f.write(h)
         for p in payloads:

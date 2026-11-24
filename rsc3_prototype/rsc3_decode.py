@@ -23,11 +23,16 @@ import rsc3_codec as r3
 import rsc3_stream as st
 
 
-def decode_channel(payload, nfr, n2, width):
+def decode_channel(payload, nfr, n2, width, fill=False):
     """
     Rebuild the amplitude-domain coefficients using only what the stream says. The step comes
     from E and b in the file, and the amplitudes come out of reconstruct_bands, which is the
     encoder's own formula.
+
+    fill comes from the header flag, not from guessing. Everything else the decoder needs for
+    the noise - which bands are dead, and what values the noise takes - it can derive, and that
+    is precisely why the fill is affordable. What it cannot derive is how loud, so that is the
+    one thing the file has to say.
     """
     n_coef = n2 // 2
     nb = st.band_grid(n_coef, width)
@@ -36,8 +41,12 @@ def decode_channel(payload, nfr, n2, width):
     prev_E = np.zeros(nb, np.int64)
     prev_b = np.zeros(nb, np.int64)
     for f in range(nfr):
-        E, b, mant = st.read_frame(r, prev_E, prev_b, width)
-        X[f] = st.reconstruct_bands(E, b, mant).reshape(-1)
+        if fill:
+            E, b, mant, codes = st.read_frame(r, prev_E, prev_b, width, fill=True)
+            X[f] = st.reconstruct_bands(E, b, mant, codes, f, width).reshape(-1)
+        else:
+            E, b, mant = st.read_frame(r, prev_E, prev_b, width)
+            X[f] = st.reconstruct_bands(E, b, mant).reshape(-1)
         prev_E, prev_b = E, b
     return X
 
@@ -63,7 +72,8 @@ def main():
     if len(chans) != h["nch"]:
         raise ValueError(f"header says {h['nch']} channels, found {len(chans)} payloads")
 
-    frames = [decode_channel(p, nfr, n2, h["width"]) for p in chans]
+    frames = [decode_channel(p, nfr, n2, h["width"], fill=bool(h["flags"] & st.FILL_FLAG))
+              for p in chans]
     # amplitude() is X * 4/N, so the inverse is X * N/4. N/4, not N/2: getting this wrong is
     # a silent 6 dB and the round trip is what catches it.
     sig = [r3.synthesise(f * (n2 / 4.0), n2, n_samp) for f in frames]
@@ -77,6 +87,9 @@ def main():
     print(f"RSC3 decode   {args.input}")
     print(f"   {n_samp} samples  {nfr} frames  {h['sr']} Hz  {h['nch']}ch   "
           f"payload {sum(h['lens']):,} B   budget {h['budget']} b/f")
+    # the fill is a property of the file, not of the person decoding it, so say which one was
+    # read. A stream that lied about this would decode to silence or to noise in the wrong bands.
+    print(f"   dead-band fill {'on, mask-safe levels' if h['flags'] & st.FILL_FLAG else 'off'}")
     print(f"   wrote {args.output}  ({os.path.getsize(args.output):,} B)")
 
 

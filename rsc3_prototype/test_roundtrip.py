@@ -59,11 +59,11 @@ def es(y, x, n2, sr):
     return 10 * np.log10(float(np.mean(a ** 2)) / max(float(np.mean((a - b) ** 2)), 1e-300))
 
 
-def one(src, kbps, n2=4096):
-    tmp = f"_rt_{kbps}.rsc3"
-    wav = f"_rt_{kbps}.wav"
+def one(src, kbps, n2=4096, extra=(), mode="safe", tag=""):
+    tmp = f"_rt_{kbps}{tag}.rsc3"
+    wav = f"_rt_{kbps}{tag}.wav"
     out = run(os.path.join(".", "rsc3_encode.py"), os.path.join(LAB, src), "-o", tmp,
-              "--bitrate", str(kbps))
+              "--bitrate", str(kbps), *extra)
     enc_es = float([t for t in out.split("ES ") if "dB" in t][0].split()[0])
     line = [t for t in out.splitlines() if "kbit/s per channel" in t]
     enc_kbps = float(line[0].split()[0]) if line else 0.0
@@ -78,14 +78,23 @@ def one(src, kbps, n2=4096):
     # not zero the two CLIs do not share a format, whatever either ES number says.
     import rsc3_encode as enc
     import rsc3_decode as dec
+    import rsc3_stream as st
     budget = int([t for t in out.splitlines() if "budget" in t][0].split("budget")[1].split()[0])
+    # Whether this file carries the noise fill comes off the header, not off a guess. That is
+    # the whole point of the flag: a decoder with no encoder beside it can tell, and a test
+    # that assumed it would be testing a decoder that only works when someone tells it.
+    with open(os.path.join(HERE, tmp), "rb") as f:
+        # HEADER_SIZE alone is not enough: unpack_header also reads the per-payload length
+        # table that follows it, so this reads a window, not the whole file.
+        flags = st.unpack_header(f.read(st.HEADER_SIZE + 64))["flags"]
+    fill = bool(flags & st.FILL_FLAG)
     n_samp = x.shape[0]
     enc_stack, q_stack = [], []
     for c in range(x.shape[1]):
         A = r3.amplitude(r3.analyse(x[:, c], n2)[0], n2)
-        p, rc = enc.encode_channel(A, sr, budget, psycho=True)
+        p, rc = enc.encode_channel(A, sr, budget, psycho=True, fill=fill, mode=mode)
         y_enc = r3.synthesise(rc * (n2 / 4.0), n2, n_samp)
-        X = dec.decode_channel(p, A.shape[0], n2, 16)
+        X = dec.decode_channel(p, A.shape[0], n2, 16, fill=fill)
         y_dec = r3.synthesise(X * (n2 / 4.0), n2, n_samp)
         if float(np.abs(y_enc - y_dec).max()) != 0.0:
             FAILS.append(f"{src}@{kbps} ch{c}: decoded coefficients differ by "
@@ -102,7 +111,8 @@ def one(src, kbps, n2=4096):
     enc_es_mine = es(np.stack(enc_stack, axis=1), x, n2, sr)
     rounded_es = es(np.stack(q_stack, axis=1), x, n2, sr)
     shift = rounded_es - enc_es_mine
-    print(f"  {src}  target {kbps} kbit/s   budget {budget} b/f   encoded {enc_kbps:6.2f} kbit/s"
+    print(f"  {src}  target {kbps} kbit/s{'  ' + tag if tag else ''}   budget {budget} b/f"
+          f"   encoded {enc_kbps:6.2f} kbit/s"
           f"   encoder ES {enc_es:5.2f} dB   decoder ES {dec_es:5.2f} dB")
     print(f"     int16 quantisation alone costs {shift:+.3f} dB of that")
     # The decoded file and the rounded reconstruction must be the same sound, to the last bit.
@@ -153,6 +163,14 @@ for src, br in (("cam15.wav", 128), ("cam15.wav", 10), ("ij15.wav", 128), ("ij15
     except Exception as e:  # a crash is a failure, not a skip
         FAILS.append(f"{src}@{br}: {e}")
         print(f"  {src}  target {br}   *** {str(e)[:200]}")
+# The loud fill levels each run by its own energy and sends no slope, so it writes different
+# words than the default and shares nothing but the field widths. It gets its own round trip for
+# that reason: a bug in how the two modes get written would otherwise only show up as audio.
+try:
+    one("cam15.wav", 10, extra=("--fill-mode", "mean"), mode="mean", tag="-loudfill")
+except Exception as e:
+    FAILS.append(f"cam15.wav@10 loudfill: {e}")
+    print(f"  cam15.wav  target 10 loudfill   *** {str(e)[:200]}")
 
 for f in os.listdir(HERE):
     if f.startswith("_rt_"):

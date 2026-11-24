@@ -49,6 +49,19 @@ import numpy as np
 MAGIC = b"RSC3"
 VERSION = 1
 MAX_BITS = 16
+FILL_FLAG = 1  # header flag bit 0: this stream carries a dead-band noise fill field
+
+# Noise fill of dead bands. A band with b = 0 decodes to silence, and at 10 kbit/s that is
+# most of everything above ~7 kHz, which is the hole this pays for. The decoder already knows
+# exactly which bands are dead from b, so the run structure costs nothing: one 6-bit level per
+# run is the whole of the side info, and code 0 means leave that run silent.
+FILL_BITS = 6
+FILL_FLOOR = -120.0
+# 2-bit tilt: dB of total fall ACROSS a run, one-sided. A run on this material is routinely a
+# hundred bands wide, so "dB per band" would be a 50 dB ramp, and the mask of a dead run only
+# ever falls with frequency - a rising floor would be encoding a mistake.
+FILL_TILT_BITS = 2
+FILL_TILT = (0.0, -12.0, -28.0, -60.0)
 
 # Field widths. GAP_BITS carries a run of skipped bins inside a band, so it must reach
 # width-1; a band holds `width` mantissas, so the count reaches width. Both are 4 and 5 for
@@ -280,24 +293,247 @@ def quantise_bands(A_band, E_band, b_band):
     return np.where(b_band[:, None] > 0, m, 0.0).astype(np.int64)
 
 
-def reconstruct_bands(E_band, b_band, mant):
-    """The one reconstruction formula. Encoder and decoder both call this, so agreement is
-    not a thing that can drift."""
-    step = band_steps(E_band, b_band)
-    return mant.astype(np.float64) * step[:, None]
+def reconstruct_bands(E_band, b_band, mant, levels=None, frame=0, width=16):
+    """
+    The one reconstruction formula. Encoder and decoder both call this, so agreement is not a
+    thing that can drift. levels=None means no fill, which is the whole point of putting it in
+    the signature: the encoder's ES and the decoder's samples come from the same call with the
+    same arguments, so a fill that only the encoder hears is impossible to ship by accident.
+    """
+    X = band_steps(E_band, b_band)[:, None] * mant.astype(np.float64)
+    if levels is not None:
+        X = fill_bands(X, dead_runs(b_band), levels, frame, width)
+    return X
+
+
+# ------------------------------------------------------------- noise fill
+# Dead bands decode to silence, which at low rate leaves a hole wherever the source had
+# something. Filling it is affordable because the decoder already knows which bands are dead:
+# b = 0, from the counts field, so the only thing to transmit is how loud the fill is.
+#
+# Two rules make this safe to put in a decoder.
+#
+# First, the noise is a pure function of (frame, band). No generator state, no sequence, no
+# per-band draw in iteration order - a streaming decoder that skips a frame, or a Luau port
+# that processes bands in a different order, still gets the same numbers. That is the property
+# fill_experiment.py never had, and it is the reason that experiment could not ship.
+#
+# Second, the level the encoder synthesises with is the level the *code* carries, not the level
+# it wanted. Both sides read the same code and reconstruct the same floor, so the encoder's own
+# ES is measured against the audio the decoder will actually play. This is the discipline the
+# parked-exponent work already established: return the decoder's state, never re-derive it.
+
+_HASH = (1 << 32) - 1
+
+
+def hash_noise(n, frame, band):
+    """mulberry32, vectorised. Two integers in, n deterministic values out: three multiplies,
+    three shifts, no state, and short enough to port to Luau without trusting a float model.
+    Uniform in [-1, 1), which is a fine input shape because it gets normalised anyway."""
+    s = (int(frame) * 0x9E3779B9 + int(band) * 0x85EBCA6B) & _HASH
+    u = np.arange(n, dtype=np.int64)
+    x = (s + u * 0x9E3779B1) & _HASH
+    x = ((x ^ (x >> 16)) * 0x85EBCA6B) & _HASH
+    x = ((x ^ (x >> 13)) * 0xC2B2AE35) & _HASH
+    x = x ^ (x >> 16)
+    return (x.astype(np.float64) / 2 ** 31 - 1.0)
+
+
+def fill_noise(band, frame, width):
+    """Unit-RMS noise for one band. The normalisation is recomputed from the values themselves,
+    on both sides, so nothing about it has to be transmitted and no rounding rule can disagree."""
+    v = hash_noise(width, frame, band)
+    return v / float(np.sqrt((v * v).mean()))
+
+
+def fill_code(level_db):
+    """A dB level onto the 6-bit word. 0 is the floor, which is silence, so leaving a run
+    empty is free rather than a special case the decoder has to be told about."""
+    step = -FILL_FLOOR / ((1 << FILL_BITS) - 1)
+    return int(np.clip(np.round((max(float(level_db), FILL_FLOOR) - FILL_FLOOR) / step),
+                       0, (1 << FILL_BITS) - 1))
+
+
+def fill_level(code):
+    """The inverse, and the only level either side is ever allowed to synthesise with."""
+    step = -FILL_FLOOR / ((1 << FILL_BITS) - 1)
+    return FILL_FLOOR + code * step if code else -1e9
+
+
+def dead_runs(b_band):
+    """Contiguous runs of dead bands, band-major, as index arrays. The decoder can derive this
+    from b alone, which is the entire reason the run is the unit of transmission."""
+    dead = np.asarray(b_band) <= 0
+    out = []
+    j = 0
+    while j < len(dead):
+        if dead[j]:
+            k = j
+            while k + 1 < len(dead) and dead[k + 1]:
+                k += 1
+            out.append(np.arange(j, k + 1))
+            j = k + 1
+        else:
+            j += 1
+    return out
+
+
+def run_tilt(code, tilt, j, lo, hi):
+    """
+    The decoder's own floor for band j of a run: a level word and a slope, no mask and no
+    source. The position is normalised across the run, -1 at its first band and +1 at its last,
+    which is what makes the tilt mean the same thing for a 2-band run and a 200-band one.
+    """
+    if not code:
+        return -1e9
+    mid = (lo + hi) * 0.5
+    half = max((hi - lo) * 0.5, 1.0)
+    return fill_level(code) + FILL_TILT[int(tilt)] * (j - mid) / half
+
+
+def fill_bands(X_band, runs, levels, frame, width):
+    """
+    Replace silence with noise, band by band. Everything the decoder needs is here: b says
+    which bands are dead, the level words say how loud, and (frame, band) seeds the same values
+    the encoder drew. The encoder calls this too, so its ES is the decoder's sound.
+
+    The seed is the band index, not the run. A run on this material is routinely 100 bands
+    wide, and giving all of them the same W values would put a comb of identical bins across
+    10 kHz, which is a filter, not a noise floor. Independent draws per band are what makes the
+    thing read as air rather than as ringing.
+    """
+    for r, (code, tilt) in zip(runs, levels):
+        if not code:
+            continue
+        lo, hi = float(int(r[0])), float(int(r[-1]))
+        for j in r:
+            lvl = run_tilt(code, tilt, float(j), lo, hi)
+            X_band[int(j)] = (fill_noise(int(j), int(frame), width)
+                              * 10.0 ** (0.05 * lvl))
+    return X_band
+
+
+def write_fill(w, b_band, levels):
+    """
+    One bit, then a level word and a slope per dead run. A frame with nothing to say pays 1
+    bit, which is the whole reason the flag exists: silence between phrases should not cost
+    eight bits a run.
+    """
+    runs = dead_runs(b_band)
+    if not runs or not any(int(c) for c, _ in levels):
+        w.put(0, 1)
+        return
+    w.put(1, 1)
+    for c, t in levels:
+        w.put(int(c), FILL_BITS)
+        w.put(int(t), FILL_TILT_BITS)
+
+
+def read_fill(r, b_band):
+    """The mirror. The run count comes from b, so this reads exactly what was written."""
+    runs = dead_runs(b_band)
+    if not r.get(1):
+        return [(0, 0)] * len(runs)
+    return [(r.get(FILL_BITS), r.get(FILL_TILT_BITS)) for _ in runs]
+
+
+def fill_cost(b_band, levels):
+    """What write_fill would charge, for the estimator."""
+    runs = dead_runs(b_band)
+    if not runs or not any(int(c) for c, _ in levels):
+        return 1
+    return 1 + (FILL_BITS + FILL_TILT_BITS) * len(runs)
 
 
 # --------------------------------------------------------------- frame grammar
 
-def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width):
+def run_fill_words(cap_db, b_band, mode="safe"):
+    """
+    What the encoder sends: one (level, slope) pair per dead run.
+
+    mode="safe" picks the run's level as loud as its own ceiling allows without exceeding it
+    anywhere inside it. For a candidate slope s the loudest legal middle is the tightest bin,
+
+        L(s) = min over bands j in the run of ( cap[j] - s * p[j] )
+
+    and the encoder keeps the s that makes that minimum largest. The level word is rounded DOWN,
+    because a code that rounds up would make the transmitted floor illegal, and the decoder
+    would be playing noise the encoder never measured.
+
+    mode="mean" fills at the run's own average energy and takes no slope. This is what the early
+    experiment did, and it is kept because it is the option that SOUNDS most like air, for the
+    one reason its level is set by the run rather than by its worst bin. Measured, that is the
+    difference between inaudible and audible: about one filled band in five ends up above its
+    own mask, and the worst of them by more than 40 dB.
+
+    cap_db is per band. How that ceiling is worked out is a masking question and lives with the
+    mask, not here.
+    """
+    out = []
+    cap = np.asarray(cap_db)
+    for r in dead_runs(b_band):
+        if mode == "mean":
+            out.append((fill_code(float(np.mean(cap[r]))), 0))
+            continue
+        j = np.arange(int(r[0]), int(r[-1]) + 1, dtype=np.float64)
+        mid = (j[0] + j[-1]) * 0.5
+        half = max((j[-1] - j[0]) * 0.5, 1.0)
+        p = (j - mid) / half
+        best_lv, best_q = FILL_FLOOR, 0
+        for q, s in enumerate(FILL_TILT):
+            lv = float(np.min(cap[r] - s * p))
+            if lv > best_lv:
+                best_lv, best_q = lv, q
+        code = fill_code(best_lv)
+        while code and fill_level(code) > best_lv + 1e-9:
+            code -= 1
+        out.append((code, best_q))
+    return out
+
+
+def band_fill_cap(A_band, thr_band=None):
+    """
+    The ceiling a band may be filled to: its own energy, and no more than the quietest bin in it
+    can hide. The second half is not decoration. A flat floor across a band is masked only if
+    its WEAKEST bin masks it, so the band's share of the cap is the minimum threshold over its
+    bins - using the band's summed masking capacity, or its mean, lets the quiet bins through,
+    which is precisely the mistake that made the first version of this audible.
+
+    Without thr_band this degrades to "fill at the band's energy", which is what the earlier
+    experiment did, and is what this file exists to prove is not safe.
+    """
+    lvl = 10.0 * np.log10(np.maximum((np.asarray(A_band) ** 2).mean(axis=-1), 10 ** FILL_FLOOR))
+    if thr_band is None:
+        return lvl
+    return np.minimum(lvl, np.maximum(np.min(np.asarray(thr_band), axis=-1), FILL_FLOOR))
+
+
+def fill_codes_all(A3all, ball, thr_all=None, mode="safe"):
+    """
+    Per-frame transport words for a whole file, derived only from the analysis, the mask and the
+    allocation - so the estimator that picks a bitrate charges exactly what the writer will
+    write, without being told anything extra. One iteration of the zip is one frame.
+    """
+    out = []
+    thr_all = [None] * len(A3all) if thr_all is None else thr_all
+    for A3, b, thr in zip(A3all, ball, thr_all):
+        out.append(run_fill_words(band_fill_cap(A3, thr), b, mode))
+    return out
+
+
+def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width, fill=None):
     """
     Append one frame's bands to `w`. The writer is told E, b and the mantissas and invents
     nothing: the encoder derives them with quantise_bands, and what the writer serialises is
     exactly what the encoder reconstructed.
 
-    Returns (E, field_bits), where field_bits counts what this frame cost in each of the
-    three fields, read off the writer itself. The size report is then the truth about the
-    file rather than a model of it, and it cannot drift when the grammar changes.
+    fill is this frame's dead-run level codes, or None for no fill field. When present it goes
+    last, after the mantissas, because the run structure is derived from b and the decoder can
+    only read it once it has those counts.
+
+    Returns (E, field_bits), counting this frame's cost in each of the four fields, read off
+    the writer itself. The size report is then the truth about the file rather than a model of
+    it, and it cannot drift when the grammar changes.
     """
     E = np.asarray(E_band, np.int64)
     b = np.asarray(b_band, np.int64)
@@ -423,19 +659,27 @@ def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width):
             scatter(out, vals.reshape(-1), np.repeat(wv, width, axis=1).reshape(-1),
                     (start[jf][:, None] + 1 + c2[None, :] * wv).reshape(-1))
         w.put_bits(out)
+    # The fill field, last, because its run structure is derived from b and the decoder only
+    # knows b after reading the counts. Nothing new is invented here: these are the very codes
+    # the encoder synthesised with, so the bits and the sound cannot disagree.
+    t3 = w.bits()
+    nfill = 0
+    if fill is not None:
+        write_fill(w, b, fill)
+        nfill = w.bits() - t3
     # E is returned as the decoder's own state: live bands updated, dead ones parked. Handing
     # this back is what makes the retention rule the same in both directions.
-    return E_next, (t2 - t1, t1 - t0, w.bits() - t2)
+    return E_next, (t2 - t1, t1 - t0, w.bits() - t2 - nfill, nfill)
 
 
-def frame_costs(Eall, ball, mant, width):
+def frame_costs(Eall, ball, mant, width, fill_levels=None):
     """
-    What one frame's three fields cost, in bits, computed without writing a single bit.
+    What one frame's fields cost, in bits, computed without writing a single bit.
 
     This exists because a rate search has no business encoding the file 15 times to answer a
     question that is arithmetic: the mantissa field is a count plus (gap, sign, magnitude) per
     nonzero, and the two delta fields are Rice codewords whose lengths are known the moment k
-    is chosen. Returns (scale, bits, mantissa) totals over the given frames.
+    is chosen. Returns (scale, bits, mantissa, fill) totals over the given frames.
 
     The numbers have to match write_frame's byte measurement. That is checked against a packed
     payload in the round trip, not assumed, because an estimator that quietly drifts would
@@ -443,7 +687,7 @@ def frame_costs(Eall, ball, mant, width):
     """
     gb, cb = gap_bits(width), count_bits(width)
     nfr = len(Eall)
-    tot = np.zeros(3, np.int64)
+    tot = np.zeros(4, np.int64)
     prev_E = np.zeros(len(ball[0]), np.int64)
     prev_b = np.zeros(len(ball[0]), np.int64)
     for f in range(nfr):
@@ -474,16 +718,23 @@ def frame_costs(Eall, ball, mant, width):
         # the cheaper of the two band shapes, plus the flag that chooses between them
         per = 1 + np.minimum(cb + n * (gb + 1 + b1), width * (1 + b1))
         tot[2] += int(np.where(live, per, 0).sum())
+        if fill_levels is not None:
+            tot[3] += fill_cost(b, fill_levels[f])
         prev_E, prev_b = np.where(live, Eall[f], prev_E), b
     return tot
 
 
-def read_frame(r, prev_E, prev_bits, width):
+def read_frame(r, prev_E, prev_bits, width, fill=False):
     """
     The mirror of write_frame, and the only path a decoder takes. It returns E, b and the
     mantissas; the caller reconstructs with reconstruct_bands, which is the same function the
     encoder used, so the decoded sound is the encoded sound by construction rather than by
     two tools agreeing twice.
+
+    fill=True says the frame carries the fourth field, and then it also returns that frame's
+    level codes, which is what reconstruct_bands needs. Passing it from the header flag rather
+    than deriving it is deliberate: the decoder is told whether to expect bits, it does not
+    infer that a stream was made with a fill on.
     """
     # The counts field, both shapes, mirrored from write_frame. A prefix-free code decides the
     # rest of the frame, so a decoder never has to guess whether a list follows.
@@ -539,6 +790,8 @@ def read_frame(r, prev_E, prev_bits, width):
             v = r.get(1 + bw)
             mant[j, i] = -(v & lim) if (v >> bw) else (v & lim)
             base = i
+    if fill:
+        return E, b, mant, read_fill(r, b)
     return E, b, mant
 
 
@@ -547,19 +800,22 @@ def read_frame(r, prev_E, prev_bits, width):
 # CLI packs it by hand. Little-endian, no padding, fixed size, then one length per payload.
 
 # Little-endian, so `<` means no alignment padding and mixed field widths are safe; the size
-# is just the sum of the fields. Fixed size, fixed order, then one length per payload.
-HEADER_FMT = "<4sBIBHHIII"
+# is just the sum of the fields. Fixed size, fixed order, then one length per payload. The
+# flags word is what makes a fill stream self-describing: a decoder that ignores it can still
+# read the frame, and one that heeds it can hear the difference, which is the whole reason
+# "it is only 6 bits a frame" is not an excuse for an undeclared bit map.
+HEADER_FMT = "<4sBIBHHIIII"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 
-def pack_header(sr, nch, n2, width, n_samples, budget, payload_lens):
+def pack_header(sr, nch, n2, width, n_samples, budget, payload_lens, flags=0):
     h = struct.pack(HEADER_FMT, MAGIC, VERSION, int(sr), int(nch), int(n2), int(width),
-                    int(n_samples), int(budget), len(payload_lens))
+                    int(n_samples), int(budget), len(payload_lens), int(flags))
     return h + b"".join(struct.pack("<I", int(L)) for L in payload_lens)
 
 
 def unpack_header(h):
-    magic, ver, sr, nch, n2, width, n_samp, budget, n_pl = struct.unpack(
+    magic, ver, sr, nch, n2, width, n_samp, budget, n_pl, flags = struct.unpack(
         HEADER_FMT, h[:HEADER_SIZE])
     if magic != MAGIC:
         raise ValueError(f"not an RSC3 file: {magic!r}")
@@ -568,7 +824,8 @@ def unpack_header(h):
     lens = [struct.unpack("<I", h[HEADER_SIZE + 4 * i:HEADER_SIZE + 4 * (i + 1)])[0]
             for i in range(n_pl)]
     return dict(sr=sr, nch=nch, n2=n2, width=width, n_samples=int(n_samp),
-                budget=int(budget), lens=lens, body_off=HEADER_SIZE + 4 * n_pl)
+                budget=int(budget), lens=lens, flags=int(flags),
+                body_off=HEADER_SIZE + 4 * n_pl)
 
 
 def frame_count(n_samples, n2):
