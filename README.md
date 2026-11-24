@@ -11,8 +11,10 @@ Audio Codec 4 Roblox :P
 |older|no|
 
 RSC2 (additive synthesis, v3 bitstream) is what ships and decodes on Roblox today.
-[RSC3](rsc3_prototype/README.md) is the block-transform successor — it measures better than
-RSC2 at lower rate, but it has no bitstream and no decoder yet, so it is prototype code only.
+[RSC3](rsc3_prototype/README.md) is the block-transform successor: it has a container, an encoder
+and a decoder, and measured against RSC2 from actual files it is about 1.7 dB better on
+`cam` and 3.0 dB better on `ij` at the same bitrate. It is not on Roblox yet, because the
+decoder is Python, so RSC2 is what you run.
 
 NOTE: for some weird reason if the audio was originally encoded using opus codec the output quality will be unpredicatble,
 
