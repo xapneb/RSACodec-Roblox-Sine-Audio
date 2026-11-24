@@ -65,12 +65,23 @@ trick that costs side info is charged **inside** the budget or the comparison do
 - **Upward band folding is dead.** Mirror alias is proportional to the loudest member of
   each pair, and upward folding pairs the loudest bins (bass) with the emptiest (treble),
   so the alias is always bass-loud. No per-frame energy correction fixes a shape error.
-- **Run-based noise fill works at equal bitrate.** Where a band is fully zeroed, the
-  decoder fills it with seeded noise at a flat floor for that contiguous run, costing
-  ~6 bits per run rather than per band: 464 mantissa + 48 fill = 512 b/f, and 16-19 kHz
-  density lands within ~1-2 dB of the source instead of -95 dB below it. It costs ~1.2 dB
-  of ES, which is expected and not a regression: matched-energy noise carries roughly
-  twice the error power of zeroing, while sounding like air instead of a hole.
+- **Run-based noise fill is affordable, and its placement is not yet solved.** Where a band
+  is fully zeroed, the decoder fills it with seeded noise whose level is one scalar per
+  contiguous run of dead bands, costing ~6 bits per run rather than per band: 464 mantissa +
+  48 fill = 512 b/f, and 16-19 kHz *aggregate* density lands within ~1-2 dB of the source
+  instead of -95 dB below it. It costs ~1.2 dB of ES, which is expected, not a regression:
+  matched-energy noise carries roughly twice the error power of zeroing, while sounding like
+  air instead of a hole.
+
+  The unresolved part is *where inside a run* that one scalar puts the level. Measured per
+  dead band, a linear mean gives a median error of -1 dB but a tail to -33 dB, with 40% of
+  bands in multi-band runs more than 6 dB off - the mean is dominated by the run's loudest
+  band, so the floor lands at the top and the quiet members are left behind. 93% of dead
+  bands live in multi-band runs, so this is not an edge case. A floor 20 dB low is
+  effectively no fill, and a floor 7 dB high is noise above the very threshold that justified
+  zeroing. The mean-in-dB (geometric) alternative is the same price and is being measured
+  against it; if it doesn't fix the tail, a run needs a small residual word per band and the
+  bill has to be re-derived. Until this is settled the fill stays out of `rsc3_codec.py`.
 
 ## What is not
 
@@ -80,8 +91,9 @@ trick that costs side info is charged **inside** the budget or the comparison do
   in 5-10 kHz, where that band pays 1.75x its share of damage per bit, and 10-14 kHz pays
   5.8x. Whether that's the waterfill bias, the uniform band widths, or the mask's HF slopes
   is a decision `hf_audit.py` was written to make, not yet made.
-- **Noise fill is not yet in the core**, and the "flat floor per run is nearly free" claim
-  still has an unexplained measurement anomaly in its spread statistic.
+- **Noise fill is not yet in the core**, and the level it puts inside a run is unresolved
+  (see the previous bullet). Run `fill_experiment.py` for the budget side and read the per-band
+  level error before trusting any listening file it produces.
 - **PVQ is unresolved.** At honestly-paid bits scalar quantisation beats PVQ by 7-8 dB, but
   the loss-vs-budget curve was flat, which in this repo is a harness symptom, not a finding.
 - The model is numpy. Encoding is far too slow for real time, and the decoder does not exist.
