@@ -21,6 +21,7 @@ gainfit_es.py           re-scores any file under a fitted gain (see "Rulers")
 audible_sweep.py        quality vs budget, scored in audible-error units
 hf_audit.py             bits / signal / error / audible-error per frequency band
 fill_experiment.py      noise-fill, priced per run of dead bands, at equal bitrate
+vector_hits.py          sparse high-frequency layer, priced combinatorially, at equal bitrate
 ```
 
 Run anything from this folder: `python ab_codec.py ..\\rsc2_testing_lab\\ij.wav`
@@ -197,18 +198,37 @@ because an allocation that changes is a different codec and not a faster one:
   in 5-10 kHz, where that band pays 1.75x its share of damage per bit, and 10-14 kHz pays
   5.8x. Whether that's the waterfill bias, the uniform band widths, or the mask's HF slopes
   is a decision `hf_audit.py` was written to make, not yet made.
-- **The decoder's cost is not measured by anything in this repo.** Every number above is bits
-  and sound, but the player pays a *sine* for each coefficient it plays, so a codec that sounds
-  the same while leaving more bins dead is cheaper to run, and nothing here has been scored on
-  that axis. Bits and oscillators are two different budgets and the frontier between them is
-  currently unmeasured.
-- **PVQ has never been implemented in this tree.** The comment in `rsc3_codec.py` calls the
-  uniform mantissa a "stand-in for PVQ", and the old line about scalar beating PVQ "by 7-8 dB
-  at honestly-paid bits" is not reproducible, so it is treated as unverified rather than as a
-  finding. What can be said from the algebra instead: a band with 16 bins is where scalar is
-  weakest, because `b` is an integer - a band one bit wide pays 16 bits and a band just under
-  that pays nothing, so near 10 kbit/s the allocation is bang-bang in 16-bit steps and the
-  rate quantum, not the source, is what limits quality. A vector code that can spend *fractional*
-  bits per band attacks exactly that, and it is a measurement problem before it is a code
-  problem.
+- **The decoder's cost is only half measured.** Every number above is bits and sound, but the
+  player pays a *sine* for each coefficient it plays, so a codec that sounds the same while
+  leaving more bins dead is cheaper to run. `vector_hits.py` scores that axis now (sines per
+  frame, and it only counts lit bins that carry mantissas or hits, not fill noise), but it is
+  scored as a side effect of a bandwidth experiment, not as a budget of its own. Bits and
+  oscillators are still two different frontiers and only one of them has been swept.
+- **PVQ was never implemented, and what replaces the claim is measured, not algebra.** The old
+  line about scalar beating PVQ "by 7-8 dB at honestly-paid bits" is gone: no code in this tree
+  produced it. What has been measured is a *sparse hit layer over the dead high-frequency region*
+  (`vector_hits.py`), priced exactly per frame as `log2 C(L, R) + R (1 + m)` plus a delta-coded
+  region scale. The region is masked out of the scalar waterfill so the bits are new, not spent
+  twice, and only bins above the mask are bought. On `cam15` at a matched rate:
+
+  | arm | kbit/s | gain-fitted ES | sines/f | 14-18 kHz |
+  |---|---:|---:|---:|---:|
+  | scalar, 48 b/f | 11.98 | 5.12 | 63.5 | -71.7 |
+  | hits 14k, `m=1`, 14.6/f | 11.84 | 4.46 | 57.6 | -46.5 |
+
+  So 25 dB of 14-18 kHz content for 0.66 dB of ES and six oscillators. At equal *quality* the
+  same bandwidth costs +31% rate (ES ~4.17 both: scalar 7.23 kbit/s, hits 9.50). One magnitude
+  bit beats two on rate and density both, which is the actual abuse: the position code is where
+  the money is, magnitude bits are where the waste is. Three things keep it from being a win:
+  above 18 kHz it buys nothing in any arm, the m=1 row
+  sits 3 dB *hotter* than the source because every hit decodes to the same level, and on `ij15`
+  there are 0.1 hits per frame above 14 kHz because that material's HF is under its own mask -
+  the layer is per-frame material, not a feature you can turn on.
+- **The premise the experiment was built to test is false.** Buying sines with a vector code does
+  not leave slack for *more* oscillators at a matched rate: scalar plays more of them for the same
+  bitrate, they just decode to noise nobody can hear. The layer buys bandwidth, not headroom, and
+  the intuition that low quantisation noise means purchasable headroom was wrong about *where* the
+  headroom is. Whether a different lever - the band's own `b` quantum, or a finer scalefactor
+  grid, which is the other half of the algebra this file replaced - is where the real headroom
+  sits is still unmeasured.
 - The model is numpy. Encoding is far too slow for real time, and the decoder does not exist.
