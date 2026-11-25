@@ -44,6 +44,14 @@ comparison this repo is allowed to publish.
 | Field cost | b/f at budgets 1 / 16 / 40 / 192: scale 6 / 14 / 21 / 59, counts 13 / 52 / 86 / 159, mantissas 21 / 149 / 304 / 1174, fill 12 / 22 / 32 / 60 |
 | Quality | 4.9-10.3 dB gain-fitted ES across that range, measured on the decoded file |
 
+Two of those rows price the bit map that ships on by default. The opt-in shape field adds 22-28 b/f
+at these rates and is priced in its own section under "What is settled"; it is not in any number
+above.
+
+Every table on this page prices the **default bit map**: mask-safe flat fill, no shape field. The
+shaped arm above 14 kHz is priced in its own section under "What is settled", so nothing here
+includes bits that are only there if `--fill-shape` was asked for.
+
 Measured against shipping RSC2 (gain-fitted ES, both from files, `mp` = RSC2's partial cap):
 
 | track | rate (kbit/s/ch) | RSC2 | RSC3 | gain |
@@ -142,6 +150,76 @@ trick that costs side info is charged **inside** the budget or the comparison do
   can be exposed by temporal masking the model does not have. If the fill ever sounds wrong,
   that is the failure mode to look for, not the mean.
 
+- **A shaped fill rides on top of the flat word above 14 kHz, as an option.** The flat word has a
+  geometric problem, not a tuning one. A dead run on this material is routinely ~120 bands wide -
+  one frame of `cam15` has a single run spanning 1.2 to 23.9 kHz - and one level plus one *straight*
+  slope has to follow a mask curve that is not straight. `_ceiling_probe.py` measures the result by
+  running the shipped rule and comparing every dead band against its own ceiling, frames 20-70:
+
+  | dead region | bands | median dB under its own ceiling | share >10 dB under |
+  |-------------|------:|--------------------------------:|-------------------:|
+  | `cam15` 9-12 kHz | 160 | -17.0 | 81% |
+  | `cam15` 12-14 kHz | 110 | -26.7 | 85% |
+  | `cam15` 14-18 kHz | 210 | -21.4 | 60% |
+  | `cam15` 18-20 kHz | 110 | -6.4 | 38% |
+  | `cam15` 20-24 kHz | 210 | -10.6 | 53% |
+
+  On `ij15` it is worse, and worse in the direction that matters: -31 to -48 dB across 9-20 kHz,
+  with 99-100% of the bands more than 10 dB below what the decoder could legally play. One straight
+  slope, pinned wherever it can be legal, has to be wrong on both sides of the curve.
+
+  The shape field is that staircase: each block of 16 dead bands in the region gets its own level
+  word, so a run can follow a curve instead of a line. One flag bit per touched run, then a 6-bit
+  first-block code and Rice-coded differences; the region is *derived* from `sr`, `n2` and `width`
+  rather than transmitted, and a code of 0 means the flat word stands, so every word that shipped
+  keeps shipping and keeps being charged. Header flag bit 1 (`SHAPE_FLAG`) declares it, because a
+  different bit map is a new codec and not an optimization.
+
+  Measured through files, `--fill-shape` at ~10 kbit/s, rates from the file and audio from the
+  decoded samples, mask column graded against the original's per-bin threshold by
+  `_fill_verify.py`:
+
+  | track / arm | kbit/s | ES | bins over mask | 14-18 kHz | 18-24 kHz |
+  |-------------|-------:|----:|---------------:|----------:|----------:|
+  | `cam15` flat | 9.78 | 4.72 | 0 / 35,254 | -72.0 | -77.4 |
+  | `cam15` shaped | 9.73 | 4.57 | 0 / 35,524 | **-55.0** | **-60.8** |
+  | `ij15` flat | 9.79 | 8.61 | 0 / 40,329 | -105.9 | -113.0 |
+  | `ij15` shaped | 9.79 | 8.41 | 0 / 41,015 | **-77.5** | **-87.2** |
+
+  So it buys 16-17 dB on `cam15` and 26-28 dB on `ij15` in the same file size, and not one bin in
+  35,524 / 41,015 ends up above the mask - which is the burden of proof a noise floor has to carry
+  before any of the other numbers mean anything. It costs 21.8 b/f on `cam15` and 27.5 b/f on
+  `ij15` (about 0.5 kbit/s per channel), and it is not an occasional extra: `cam15` lit at least
+  one block in 291 of its 353 frames, `ij15` in 349, and no frame paid nothing at all
+  (`_shape_rate.py`, which walks the same `shape_field` call the writer is handed). The estimator
+  charges it, which is what makes the rate honest: the probe said 9.92 against 9.72 measured, the
+  same -2% bias the flat field carries, and field accounting versus the file is 3 bits. It is not
+  only a low-rate trick: at 128 kbit/s it still lands 0 bins over mask, buys +6.2 dB in 18-24 kHz on
+  `cam15` and +17.3 dB on `ij15`, for 0.2-0.7% of rate.
+
+  **What the rulers say is that neither of them decides this.** At 10 kbit/s, gain-fitted ES goes
+  *down* by 0.15-0.2 dB, which is exactly what putting noise where there was silence does to a
+  metric that structurally prefers silence - the same trap the mean-level fill fell into, and the
+  reason it is not evidence. The audible ledger is flat too, and this time through the files:
+  -45.2 dB with the flat word and -45.1 dB shaped on `cam15`, -59.0 against -58.7 on `ij15`, with
+  the share of error power that clears the mask the same to a tenth of a percent (54.0% / 53.9%).
+  The reason is geometric: on this material that ledger is dominated by 0-10 kHz and the shape field
+  is not permitted to touch anything below 14 kHz. An ES that cannot move, in a region the audible
+  ledger never reports on, is a decision for the ears:
+  `listening/cam15_shape_{flat,blk16,bins}.wav` is that A/B, and until someone has listened it this
+  is an option with measured prices, not a win. (`_shape_aud.py` produces both columns by running
+  the two CLIs, and scores both arms against the original's mask so neither is graded on its own
+  curve.)
+
+  Shape and the sparse hits layer buy different currencies and do not rank against each other. The
+  hits arm bought the *positions* of sines that really are above the mask, and on `cam15` that was
+  cheap for what it is: 14.6 b/f for 25 dB of 14-18 kHz content. It is also per-frame material -
+  `ij15` offers 0.1 hits per frame above 14 kHz, because there is nothing there to place - and its
+  `m=1` row decodes 3 dB hot of the source because every hit is given the same magnitude. Shape
+  needs no content to exist, so it works on both tracks, and its levels are floored under each
+  band's own mask by construction, which a single-magnitude hit layer is not. Neither is a
+  substitute: a floor is not a position, and positions are not a floor.
+
 ## Speed
 
 The encoder is the slow part, and the profile was not where I expected. Analysis is ~60x
@@ -231,4 +309,11 @@ because an allocation that changes is a different codec and not a faster one:
   headroom is. Whether a different lever - the band's own `b` quantum, or a finer scalefactor
   grid, which is the other half of the algebra this file replaced - is where the real headroom
   sits is still unmeasured.
+- **The shape field has no gate.** It is written in nearly every frame that has a dead run, and its
+  per-frame cost is tightly clustered rather than heavy-tailed: mean 21.8 b/f, p50 26, p90 29, max 31
+  on `cam15` (`_shape_rate.py`), so there is no population of cheap frames to skip. That is why it is
+  an option and not the format - it buys density with a standing charge, not with an occasional one.
+  The thing to try against it is the cheapest option and needs no new decoding logic, because a
+  skipped field already decodes to the flat word: one bit per frame saying this frame's region is not
+  worth shaping. Whether that bit ever pays for itself is unmeasured, so it is not claimed.
 - The model is numpy. Encoding is far too slow for real time, and the decoder does not exist.
