@@ -34,9 +34,9 @@ import rsc3_stream as st
 
 N2 = 4096
 W = r3.BAND_WIDTH
-GROUPS = ((0, 5e3), (5e3, 10e3), (10e3, 14e3), (14e3, 20e3))
+GROUPS = ((0, 5e3), (5e3, 10e3), (10e3, 14e3), (14e3, 18e3), (18e3, 24e3))
 ARMS = (("off", ["--no-fill"]), ("safe", ["--fill-mode", "safe"]),
-        ("loud", ["--fill-mode", "mean"]))
+        ("loud", ["--fill-mode", "mean"]), ("shape", ["--fill-shape"]))
 
 
 def read_wav(p):
@@ -64,11 +64,18 @@ def decode_stream(path):
     pe = np.zeros(nbands, np.int64)
     pb = np.zeros(nbands, np.int64)
     fill = bool(h["flags"] & st.FILL_FLAG)
+    shape = bool(h["flags"] & st.SHAPE_FLAG)
+    reg = st.shape_reg(h["sr"], h["n2"], h["width"]) if shape else None
     X, B = [], []
     for f in range(nfr):
-        if fill:
-            e, b, m, lv = st.read_frame(r, pe, pb, h["width"], fill=True)
-            X.append(st.reconstruct_bands(e, b, m, lv, f, h["width"]))
+        if fill or shape:
+            got = st.read_frame(r, pe, pb, h["width"], fill=fill, shape=shape, reg=reg)
+            if shape:
+                e, b, m, lv, wd = got
+            else:
+                e, b, m, lv = got
+                wd = None
+            X.append(st.reconstruct_bands(e, b, m, lv, f, h["width"], shape=wd))
         else:
             e, b, m = st.read_frame(r, pe, pb, h["width"])
             X.append(st.reconstruct_bands(e, b, m))

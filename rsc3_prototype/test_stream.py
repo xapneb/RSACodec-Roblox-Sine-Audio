@@ -190,5 +190,63 @@ check("header round-trips",
       (d["sr"], d["nch"], d["n2"], d["width"], d["n_samples"], d["budget"], d["lens"]) ==
       (48000, 2, 4096, 16, 720000, 384, [9, 9]), f"{len(h)} B")
 
+# 4 ------------------------------------------------------------------ shape field
+# The shape field is new grammar with a derived region, so its whole correctness claim is that
+# write_shape's bits and read_shape's words land on the same per-band table, that the estimator
+# charges exactly what the writer writes, and that both sides rebuild the same samples.
+x15 = wave.open(os.path.join(LAB, "cam15.wav"), "rb")
+sr15 = x15.getframerate()
+xx = np.frombuffer(x15.readframes(int(15 * sr15)), np.int16).astype(np.float64)
+x15.close()
+x15d = xx.reshape(-1, 2)[:, 0] / 32768.0
+A = r3.amplitude(r3.analyse(x15d, N2)[0], N2)
+nf = A.shape[0]
+A3 = A.reshape(nf, NB, W)
+thr3 = r3.threshold_dbfs(20.0 * np.log10(np.maximum(np.abs(A), 1e-30)), sr15, A.shape[1],
+                         psycho=True).reshape(nf, NB, W)
+bits = np.clip(r3.allocate(A, sr15, 24, psycho=True).reshape(nf, NB, W).max(axis=2)
+               .astype(np.int64), 0, 16)
+reg = cur.shape_reg(sr15, N2, W)
+wf = cur.Writer()
+pe = np.zeros(NB, np.int64)
+pb = np.zeros(NB, np.int64)
+sh, SF, E2, M2, sf_all = [], [], [], [], []
+for f in range(nf):
+    e = cur.band_exponents(A3[f])
+    m = cur.quantise_bands(A3[f], e, bits[f])
+    sf = cur.shape_field(cur.band_fill_cap(A3[f], thr3[f]), bits[f], reg)
+    _, field = cur.write_frame(wf, e, bits[f], m, pe, pb, W, shape=sf)
+    sh.append(cur.shape_expand(sf, bits[f], reg))
+    SF.append(field[-1])
+    E2.append(e)
+    M2.append(m)
+    sf_all.append(sf)
+    pe = np.where(bits[f] > 0, e, pe)
+    pb = bits[f].astype(np.int64)
+blob = wf.done()
+rr = cur.Reader(blob)
+pe = np.zeros(NB, np.int64)
+pb = np.zeros(NB, np.int64)
+got_sh = []
+for f in range(nf):
+    e, b, m, _, words = cur.read_frame(rr, pe, pb, W, shape=True, reg=reg)
+    got_sh.append(words)
+    pe, pb = e, b
+check("shape field round-trips",
+      all(np.array_equal(got_sh[f], sh[f]) for f in range(nf)),
+      f"{nf} frames, {sum(int(v.sum()) for v in got_sh)} lit bands")
+# the estimator charge vs the writer, on the very same fields the writer was handed.
+t5 = cur.frame_costs(np.array(E2), bits, np.array(M2), W, shape_fields=sf_all)
+check("shape estimator matches the writer", int(t5[4]) == int(sum(SF)),
+      f"estimator {int(t5[4])} b vs writer {int(sum(SF))} b over {nf} frames")
+# and the sound: encoder words and decoder words must build the same samples.
+enc_x = np.array([cur.reconstruct_bands(E2[f], bits[f], M2[f], None, f, W,
+                                        shape=sh[f]) for f in range(nf)])
+dec_x = np.array([cur.reconstruct_bands(E2[f], bits[f], M2[f], None, f, W,
+                                        shape=got_sh[f]) for f in range(nf)])
+check("shape decodes to the encoder's own samples",
+      float(np.abs(enc_x - dec_x).max()) == 0.0,
+      f"max diff {float(np.abs(enc_x - dec_x).max()):.1e}")
+
 print("\n" + ("all checks passed" if not fails else f"{len(fails)} FAILED: {fails}"))
 sys.exit(1 if fails else 0)

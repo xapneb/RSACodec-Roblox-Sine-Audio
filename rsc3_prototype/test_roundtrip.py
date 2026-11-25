@@ -88,13 +88,15 @@ def one(src, kbps, n2=4096, extra=(), mode="safe", tag=""):
         # table that follows it, so this reads a window, not the whole file.
         flags = st.unpack_header(f.read(st.HEADER_SIZE + 64))["flags"]
     fill = bool(flags & st.FILL_FLAG)
+    shape = bool(flags & st.SHAPE_FLAG)
     n_samp = x.shape[0]
     enc_stack, q_stack = [], []
     for c in range(x.shape[1]):
         A = r3.amplitude(r3.analyse(x[:, c], n2)[0], n2)
-        p, rc = enc.encode_channel(A, sr, budget, psycho=True, fill=fill, mode=mode)
+        p, rc = enc.encode_channel(A, sr, budget, psycho=True, fill=fill, mode=mode,
+                                   shape=shape)
         y_enc = r3.synthesise(rc * (n2 / 4.0), n2, n_samp)
-        X = dec.decode_channel(p, A.shape[0], n2, 16, fill=fill)
+        X = dec.decode_channel(p, A.shape[0], n2, 16, fill=fill, shape=shape, sr=sr)
         y_dec = r3.synthesise(X * (n2 / 4.0), n2, n_samp)
         if float(np.abs(y_enc - y_dec).max()) != 0.0:
             FAILS.append(f"{src}@{kbps} ch{c}: decoded coefficients differ by "
@@ -171,6 +173,15 @@ try:
 except Exception as e:
     FAILS.append(f"cam15.wav@10 loudfill: {e}")
     print(f"  cam15.wav  target 10 loudfill   *** {str(e)[:200]}")
+# The shape field is a new bit map with a header flag of its own, and its decode path runs
+# through read_shape, which nothing else touches. It gets a round trip at the rate where the
+# layer is a real share of the frame, on both reference tracks.
+for src, br in (("cam15.wav", 10), ("ij15.wav", 10)):
+    try:
+        one(src, br, extra=("--fill-shape",), tag="-shape")
+    except Exception as e:
+        FAILS.append(f"{src}@{br} shape: {e}")
+        print(f"  {src}  target {br} shape   *** {str(e)[:200]}")
 
 for f in os.listdir(HERE):
     if f.startswith("_rt_"):

@@ -49,7 +49,8 @@ def band_bits(A, sr, budget, psycho=True):
     return np.clip(b.astype(np.int64), 0, st.MAX_BITS)
 
 
-def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe"):
+def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe",
+                   shape=False):
     """
     Returns (payload, recon), where recon is built by the shared reconstruct_bands - the same
     code the decoder will run - so the encoder's quality number is the decoder's, not the
@@ -60,6 +61,11 @@ def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe
     quality of the audio it will actually deliver, and an ES measured without the fill would be
     a claim about a file that does not exist. The words used for synthesis and the words written
     to the payload are the same object, so that cannot come apart.
+
+    shape adds the fifth field on the dead bands above SHAPE_F0: per-block level words riding on
+    top of the flat run words, which is the layer measured in the shape experiments. It is an
+    option rather than the default because it is new grammar and buys its bits with density, not
+    because it is free - a decoder told by the header flag is the only thing that makes it safe.
     """
     nfr, nc = A.shape
     nb = st.band_grid(nc, WIDTH)
@@ -68,15 +74,16 @@ def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe
     # The fill ceiling is a masking question, and the allocation already knows the mask, so
     # taking the same threshold here is not extra theory - it is the same number, asked for.
     # "mean" fill does not need it, and getting it anyway would cost a mask per frame for
-    # nothing.
+    # nothing. The shape field always does: its whole claim to legality is per-band mask.
     thr3 = (r3.threshold_dbfs(20.0 * np.log10(np.maximum(np.abs(A), 1e-30)), sr, nc,
                               psycho=psycho).reshape(nfr, nb, WIDTH)
-            if fill and mode == "safe" else None)
+            if (fill and mode == "safe") or shape else None)
+    reg = st.shape_reg(sr, 2 * nc, WIDTH) if shape else None
     recon = np.zeros((nfr, nc))
     w = st.Writer()
     prev_E = np.zeros(nb, np.int64)
     prev_b = np.zeros(nb, np.int64)
-    cost = np.zeros(4, np.int64) if want_cost else None
+    cost = np.zeros(5, np.int64) if want_cost else None
 
     for f in range(nfr):
         b = bits[f]
@@ -84,9 +91,14 @@ def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe
         mant = st.quantise_bands(A3[f], E, b)
         words = (st.run_fill_words(st.band_fill_cap(A3[f], None if thr3 is None else thr3[f]),
                                    b, mode) if fill else None)
-        recon[f] = st.reconstruct_bands(E, b, mant, words, f, WIDTH).reshape(-1)
+        if shape:
+            sf = st.shape_field(st.band_fill_cap(A3[f], thr3[f]), b, reg)
+            sw = st.shape_expand(sf, b, reg)
+        recon[f] = st.reconstruct_bands(E, b, mant, words, f, WIDTH,
+                                        shape=sw if shape else None).reshape(-1)
 
-        E, field = st.write_frame(w, E, b, mant, prev_E, prev_b, WIDTH, fill=words)
+        E, field = st.write_frame(w, E, b, mant, prev_E, prev_b, WIDTH, fill=words,
+                                  shape=sf if shape else None)
         if want_cost:
             cost += np.array(field, np.int64)
         prev_E, prev_b = E, b
@@ -120,7 +132,18 @@ def main():
                          "nothing measured is above the audibility floor; mean levels the run "
                          "at its own energy, which is louder and airier and, measured, lands "
                          "about one band in five above the mask")
+    ap.add_argument("--fill-shape", dest="fill_shape", action="store_true",
+                    help="add the shape field above 14 kHz: per-block level words over the dead "
+                         "region, delta-coded. The measured case is geometry - a dead run is "
+                         "routinely ~120 bands wide and one straight slope cannot follow a mask "
+                         "curve that is not straight, so the flat word leaves 14-20 kHz ~17 dB "
+                         "under its own ceiling on cam15 and ~30-45 dB under on ij15 "
+                         "(_ceiling_probe.py). Costs 22-28 b/f, buys that density back as noise "
+                         "measured under the mask, and declares itself with a header flag "
+                         "because it is a new bit map.")
     args = ap.parse_args()
+    if args.fill_shape:
+        args.fill = True  # the shape field rides on the fill; no fill, nothing to ride on
 
     x, sr = read_wav(args.input)
     nch = x.shape[1]
@@ -144,7 +167,7 @@ def main():
         for A in A_all:
             p, rc, cost = encode_channel(A, sr, budget, psycho=not args.blind,
                                          want_cost=True, fill=args.fill,
-                                         mode=args.fill_mode)
+                                         mode=args.fill_mode, shape=args.fill_shape)
             payloads.append(p)
             recons.append(rc)
             costs.append(cost)
@@ -174,9 +197,15 @@ def main():
             thr = (r3.threshold_dbfs(20.0 * np.log10(np.maximum(np.abs(A), 1e-30)), sr,
                                      A.shape[1], psycho=not args.blind)
                    .reshape(n, nb, WIDTH)
-                   if args.fill and args.fill_mode == "safe" else None)
+                   if (args.fill and args.fill_mode == "safe") or args.fill_shape else None)
             fl = st.fill_codes_all(A3, bits, thr, args.fill_mode) if args.fill else None
-            tot += float(st.frame_costs(E, bits, M, WIDTH, fill_levels=fl).sum())
+            sf = None
+            if args.fill_shape:
+                reg = st.shape_reg(sr, 2 * A.shape[1], WIDTH)
+                cap = np.array([st.band_fill_cap(A3[f], thr[f]) for f in range(n)])
+                sf = [st.shape_field(cap[f], bits[f], reg) for f in range(n)]
+            tot += float(st.frame_costs(E, bits, M, WIDTH, fill_levels=fl,
+                                        shape_fields=sf).sum())
         return tot / max(nsub, 1) * frate / 1000.0
 
     if args.no_search:
@@ -221,10 +250,13 @@ def main():
 
     print(f"   budget {chosen} b/f   scale {cost[0] / nfr:7.1f} b/f   "
           f"bits {cost[1] / nfr:6.1f} b/f   mantissa {cost[2] / nfr:7.1f} b/f   "
-          f"fill {cost[3] / nfr:5.1f} b/f   (per channel)")
-    print(f"   side info is {(cost[0] + cost[1] + cost[3]) / max(cost.sum(), 1) * 100:.0f}%"
+          f"fill {cost[3] / nfr:5.1f} b/f"
+          + (f"   shape {cost[4] / nfr:5.1f} b/f" if args.fill_shape else "")
+          + "   (per channel)")
+    print(f"   side info is {(cost[0] + cost[1] + cost[3] + cost[4]) / max(cost.sum(), 1) * 100:.0f}%"
           f" of the file   dead-band fill "
-          f"{'on' if args.fill else 'OFF, silence where the source had something'}")
+          f"{'on' if args.fill else 'OFF, silence where the source had something'}"
+          + (f", shaped above {st.SHAPE_F0 / 1e3:.0f} kHz" if args.fill_shape else ""))
     # The fields must add up to the bytes. Attributed bits can only differ from the file by
     # the final byte-flush padding, so a drift over 7 bits means a field went unwritten, or
     # read twice, and no rate number printed below is worth quoting.
@@ -239,7 +271,8 @@ def main():
         print(f"   probe-frame estimate {est:7.2f} kbit/s   measured {kbps / nch:7.2f}"
               f"   bias {bias * 100:+5.1f}%")
     h = st.pack_header(sr, nch, N2, WIDTH, n_samp, chosen, [len(p) for p in payloads],
-                       flags=st.FILL_FLAG if args.fill else 0)
+                       flags=(st.FILL_FLAG if args.fill else 0)
+                             | (st.SHAPE_FLAG if args.fill_shape else 0))
     with open(out, "wb") as f:
         f.write(h)
         for p in payloads:

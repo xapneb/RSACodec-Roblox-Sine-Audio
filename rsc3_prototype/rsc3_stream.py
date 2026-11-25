@@ -50,6 +50,16 @@ MAGIC = b"RSC3"
 VERSION = 1
 MAX_BITS = 16
 FILL_FLAG = 1  # header flag bit 0: this stream carries a dead-band noise fill field
+# Header flag bit 1: dead bands above SHAPE_F0 also carry the shape field - one delta-coded
+# level word per block of SHAPE_BLOCK dead bands, riding on top of the fill. The measured case
+# for it is geometry: a dead run here is routinely ~120 bands wide, and one level plus one
+# STRAIGHT slope cannot follow a mask curve that is not straight, so the run lands far below what
+# its own bands could legally carry. _ceiling_probe.py measures that gap: median −21 dB in
+# 14-18 kHz on cam15, −42 dB on ij15. A different bit map is a new codec, so it gets a flag word,
+# not a tweak.
+SHAPE_FLAG = 2
+SHAPE_F0 = 14000.0
+SHAPE_BLOCK = 16
 
 # Noise fill of dead bands. A band with b = 0 decodes to silence, and at 10 kbit/s that is
 # most of everything above ~7 kHz, which is the hole this pays for. The decoder already knows
@@ -293,17 +303,31 @@ def quantise_bands(A_band, E_band, b_band):
     return np.where(b_band[:, None] > 0, m, 0.0).astype(np.int64)
 
 
-def reconstruct_bands(E_band, b_band, mant, levels=None, frame=0, width=16):
+def reconstruct_bands(E_band, b_band, mant, levels=None, frame=0, width=16, shape=None):
     """
     The one reconstruction formula. Encoder and decoder both call this, so agreement is not a
     thing that can drift. levels=None means no fill, which is the whole point of putting it in
     the signature: the encoder's ES and the decoder's samples come from the same call with the
     same arguments, so a fill that only the encoder hears is impossible to ship by accident.
+    shape is the per-band words of the shape field, applied after the fill where they are lit.
     """
     X = band_steps(E_band, b_band)[:, None] * mant.astype(np.float64)
     if levels is not None:
         X = fill_bands(X, dead_runs(b_band), levels, frame, width)
+    if shape is not None:
+        X = shape_bands(X, shape, frame, width)
     return X
+
+
+def shape_bands(X_band, words, frame, width):
+    """Where a shape word is lit it replaces what the run word laid there - one band, its own
+    word, the same deterministic noise draw - and where it is zero the fill stands untouched.
+    Both outcomes are band-safe: the word came from the band's own ceiling, and the run word
+    is floored under the run's tightest bin."""
+    for j in np.flatnonzero(np.asarray(words, np.int64) > 0):
+        X_band[int(j)] = (fill_noise(int(j), int(frame), width)
+                          * 10.0 ** (0.05 * fill_level(int(words[int(j)]))))
+    return X_band
 
 
 # ------------------------------------------------------------- noise fill
@@ -508,6 +532,129 @@ def band_fill_cap(A_band, thr_band=None):
     return np.minimum(lvl, np.maximum(np.min(np.asarray(thr_band), axis=-1), FILL_FLOOR))
 
 
+def shape_reg(sr, n2, width):
+    """Which bands the shape field covers: band centres above SHAPE_F0. Derived, never sent -
+    the decoder already knows sr, n2 and width from the header, and a field whose position is
+    derived is a field that costs nothing to describe. Both sides call this one function, so
+    the region cannot drift between them."""
+    nc = n2 // 2
+    hz = np.arange(nc) * (sr / n2)
+    return hz.reshape(nc // width, width).mean(axis=1) >= SHAPE_F0
+
+
+def shape_codes(cap_db, b):
+    """Each dead band's own ceiling floored DOWN onto the fill word grid: what could be sent if
+    every band were described individually. Floor, not round, because a word that rounds up is
+    the decoder playing noise the encoder never certified."""
+    step = -FILL_FLOOR / ((1 << FILL_BITS) - 1)
+    c = np.floor((np.maximum(np.asarray(cap_db, np.float64), FILL_FLOOR)
+                  - FILL_FLOOR) / step + 1e-9)
+    c = np.clip(c, 0, (1 << FILL_BITS) - 1).astype(np.int64)
+    c[np.asarray(b) > 0] = 0
+    return c
+
+
+def block_shape(codes, block):
+    """Per-block level = MIN of the block's codes, so a block decodes at the level that is
+    legal for its tightest band, not one word per band."""
+    codes = np.asarray(codes, np.int64)
+    m = codes.size
+    if m == 0:
+        return codes
+    return np.array([int(codes[i * block:min(i * block + block, m)].min())
+                     for i in range((m + block - 1) // block)], np.int64)
+
+
+def shape_field(cap_db, b, reg, block=SHAPE_BLOCK):
+    """The shape grammar of one frame, as one block-code stream per dead run, parallel to
+    dead_runs(b). None where the region does not touch the run, which is derivable from b and
+    costs nothing, and a run whose blocks are all silent sends a single flag bit."""
+    codes = shape_codes(cap_db, b)
+    field = []
+    for r in dead_runs(b):
+        sel = r[reg[r]]
+        if sel.size == 0:
+            field.append(None)
+            continue
+        field.append(block_shape(codes[sel], block))
+    return field
+
+
+def shape_expand(field, b, reg, block=SHAPE_BLOCK):
+    """The per-band words the reconstruct formula uses, derived from the per-run streams. Both
+    sides take this exact path - the encoder before synthesising, the decoder after reading -
+    so what the encoder measures is the decoder's sound rather than its intent."""
+    out = np.zeros(len(b), np.int64)
+    for r, lv in zip(dead_runs(b), field):
+        if lv is None:
+            continue
+        sel = r[reg[r]]
+        m = (sel.size + block - 1) // block
+        for t, j in enumerate(sel):
+            c = int(lv[min(t // block, m - 1)])
+            if c > 0:
+                out[int(j)] = c
+    return out
+
+
+def write_shape(w, field):
+    """Per touched run: 1 flag bit; if anything is lit, the first block's absolute word, and
+    for a multi-block run a 5-bit Rice parameter and the delta stream. Deltas rather than words
+    because mask shapes are smooth, and a delta that says "same" costs k+1 bits."""
+    for lv in field:
+        if lv is None:
+            continue
+        if not lv.any():
+            w.put(0, 1)
+            continue
+        w.put(1, 1)
+        w.put(int(lv[0]), FILL_BITS)
+        if lv.size > 1:
+            z = zz_vec(np.diff(lv).astype(np.int64))
+            k = pick_k(z)
+            w.put(k, 5)
+            write_rice(w, z, k)
+
+
+def read_shape(r, b, reg, block=SHAPE_BLOCK):
+    """The mirror: runs and block counts come from b, so this reads exactly what was written."""
+    out = np.zeros(len(b), np.int64)
+    for rv in dead_runs(b):
+        sel = rv[reg[rv]]
+        if sel.size == 0:
+            continue
+        if not r.get(1):
+            continue
+        lv = [r.get(FILL_BITS)]
+        m = (sel.size + block - 1) // block
+        if m > 1:
+            k = r.get(5)
+            d = [unz(v) for v in read_rice(r, m - 1, k)]
+            lv.extend(lv[-1] + dt for dt in d)
+        for t, j in enumerate(sel):
+            c = int(lv[min(t // block, m - 1)])
+            if c > 0:
+                out[int(j)] = c
+    return out
+
+
+def shape_cost(field):
+    """What write_shape would charge, for the estimator."""
+    tot = 0
+    for lv in field:
+        if lv is None:
+            continue
+        tot += 1
+        if lv.any():
+            tot += FILL_BITS
+            if lv.size > 1:
+                z = zz_vec(np.diff(lv).astype(np.int64))
+                k = pick_k(z)
+                _, wd = rice_fields(z, k)
+                tot += 5 + int(wd.sum())
+    return tot
+
+
 def fill_codes_all(A3all, ball, thr_all=None, mode="safe"):
     """
     Per-frame transport words for a whole file, derived only from the analysis, the mask and the
@@ -521,7 +668,7 @@ def fill_codes_all(A3all, ball, thr_all=None, mode="safe"):
     return out
 
 
-def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width, fill=None):
+def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width, fill=None, shape=None):
     """
     Append one frame's bands to `w`. The writer is told E, b and the mantissas and invents
     nothing: the encoder derives them with quantise_bands, and what the writer serialises is
@@ -667,19 +814,27 @@ def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width, fill=None):
     if fill is not None:
         write_fill(w, b, fill)
         nfill = w.bits() - t3
+    # The shape field, last of all: like the fill, its run structure is derived from b, so it
+    # can only be read once the counts are known. Nothing here re-decides the levels - the same
+    # per-run streams were synthesised with on both sides of reconstruct_bands.
+    nshape = 0
+    if shape is not None:
+        t4 = w.bits()
+        write_shape(w, shape)
+        nshape = w.bits() - t4
     # E is returned as the decoder's own state: live bands updated, dead ones parked. Handing
     # this back is what makes the retention rule the same in both directions.
-    return E_next, (t2 - t1, t1 - t0, w.bits() - t2 - nfill, nfill)
+    return E_next, (t2 - t1, t1 - t0, w.bits() - t2 - nfill - nshape, nfill, nshape)
 
 
-def frame_costs(Eall, ball, mant, width, fill_levels=None):
+def frame_costs(Eall, ball, mant, width, fill_levels=None, shape_fields=None):
     """
     What one frame's fields cost, in bits, computed without writing a single bit.
 
     This exists because a rate search has no business encoding the file 15 times to answer a
     question that is arithmetic: the mantissa field is a count plus (gap, sign, magnitude) per
     nonzero, and the two delta fields are Rice codewords whose lengths are known the moment k
-    is chosen. Returns (scale, bits, mantissa, fill) totals over the given frames.
+    is chosen. Returns (scale, bits, mantissa, fill, shape) totals over the given frames.
 
     The numbers have to match write_frame's byte measurement. That is checked against a packed
     payload in the round trip, not assumed, because an estimator that quietly drifts would
@@ -687,7 +842,7 @@ def frame_costs(Eall, ball, mant, width, fill_levels=None):
     """
     gb, cb = gap_bits(width), count_bits(width)
     nfr = len(Eall)
-    tot = np.zeros(4, np.int64)
+    tot = np.zeros(5, np.int64)
     prev_E = np.zeros(len(ball[0]), np.int64)
     prev_b = np.zeros(len(ball[0]), np.int64)
     for f in range(nfr):
@@ -720,11 +875,13 @@ def frame_costs(Eall, ball, mant, width, fill_levels=None):
         tot[2] += int(np.where(live, per, 0).sum())
         if fill_levels is not None:
             tot[3] += fill_cost(b, fill_levels[f])
+        if shape_fields is not None:
+            tot[4] += shape_cost(shape_fields[f])
         prev_E, prev_b = np.where(live, Eall[f], prev_E), b
     return tot
 
 
-def read_frame(r, prev_E, prev_bits, width, fill=False):
+def read_frame(r, prev_E, prev_bits, width, fill=False, shape=False, reg=None):
     """
     The mirror of write_frame, and the only path a decoder takes. It returns E, b and the
     mantissas; the caller reconstructs with reconstruct_bands, which is the same function the
@@ -735,6 +892,9 @@ def read_frame(r, prev_E, prev_bits, width, fill=False):
     level codes, which is what reconstruct_bands needs. Passing it from the header flag rather
     than deriving it is deliberate: the decoder is told whether to expect bits, it does not
     infer that a stream was made with a fill on.
+
+    shape=True is the fifth field, read after the fill and derived from the same b. The region
+    comes from reg = shape_reg(...), which is computed, not sent.
     """
     # The counts field, both shapes, mirrored from write_frame. A prefix-free code decides the
     # rest of the frame, so a decoder never has to guess whether a list follows.
@@ -790,8 +950,14 @@ def read_frame(r, prev_E, prev_bits, width, fill=False):
             v = r.get(1 + bw)
             mant[j, i] = -(v & lim) if (v >> bw) else (v & lim)
             base = i
-    if fill:
-        return E, b, mant, read_fill(r, b)
+    if fill or shape:
+        codes = read_fill(r, b) if fill else None
+        if shape:
+            words = read_shape(r, b, reg)
+            if fill:
+                return E, b, mant, codes, words
+            return E, b, mant, codes, words
+        return E, b, mant, codes
     return E, b, mant
 
 

@@ -23,7 +23,7 @@ import rsc3_codec as r3
 import rsc3_stream as st
 
 
-def decode_channel(payload, nfr, n2, width, fill=False):
+def decode_channel(payload, nfr, n2, width, fill=False, shape=False, sr=None):
     """
     Rebuild the amplitude-domain coefficients using only what the stream says. The step comes
     from E and b in the file, and the amplitudes come out of reconstruct_bands, which is the
@@ -32,18 +32,25 @@ def decode_channel(payload, nfr, n2, width, fill=False):
     fill comes from the header flag, not from guessing. Everything else the decoder needs for
     the noise - which bands are dead, and what values the noise takes - it can derive, and that
     is precisely why the fill is affordable. What it cannot derive is how loud, so that is the
-    one thing the file has to say.
+    one thing the file has to say. shape is likewise the header's business: the region comes
+    from sr and the block geometry, both of which the header already carries.
     """
     n_coef = n2 // 2
     nb = st.band_grid(n_coef, width)
     r = st.Reader(payload)
+    reg = st.shape_reg(sr, n2, width) if shape else None
     X = np.zeros((nfr, n_coef))
     prev_E = np.zeros(nb, np.int64)
     prev_b = np.zeros(nb, np.int64)
     for f in range(nfr):
-        if fill:
-            E, b, mant, codes = st.read_frame(r, prev_E, prev_b, width, fill=True)
-            X[f] = st.reconstruct_bands(E, b, mant, codes, f, width).reshape(-1)
+        if fill or shape:
+            got = st.read_frame(r, prev_E, prev_b, width, fill=fill, shape=shape, reg=reg)
+            if shape:
+                E, b, mant, codes, words = got
+            else:
+                E, b, mant, codes = got
+                words = None
+            X[f] = st.reconstruct_bands(E, b, mant, codes, f, width, shape=words).reshape(-1)
         else:
             E, b, mant = st.read_frame(r, prev_E, prev_b, width)
             X[f] = st.reconstruct_bands(E, b, mant).reshape(-1)
@@ -72,7 +79,9 @@ def main():
     if len(chans) != h["nch"]:
         raise ValueError(f"header says {h['nch']} channels, found {len(chans)} payloads")
 
-    frames = [decode_channel(p, nfr, n2, h["width"], fill=bool(h["flags"] & st.FILL_FLAG))
+    frames = [decode_channel(p, nfr, n2, h["width"],
+                             fill=bool(h["flags"] & st.FILL_FLAG),
+                             shape=bool(h["flags"] & st.SHAPE_FLAG), sr=h["sr"])
               for p in chans]
     # amplitude() is X * 4/N, so the inverse is X * N/4. N/4, not N/2: getting this wrong is
     # a silent 6 dB and the round trip is what catches it.
@@ -89,7 +98,10 @@ def main():
           f"payload {sum(h['lens']):,} B   budget {h['budget']} b/f")
     # the fill is a property of the file, not of the person decoding it, so say which one was
     # read. A stream that lied about this would decode to silence or to noise in the wrong bands.
-    print(f"   dead-band fill {'on, mask-safe levels' if h['flags'] & st.FILL_FLAG else 'off'}")
+    print(f"   dead-band fill "
+          f"{'on, mask-safe levels' if h['flags'] & st.FILL_FLAG else 'off'}"
+          + (f", shaped above {st.SHAPE_F0 / 1e3:.0f} kHz"
+             if h['flags'] & st.SHAPE_FLAG else ""))
     print(f"   wrote {args.output}  ({os.path.getsize(args.output):,} B)")
 
 
