@@ -10,7 +10,7 @@ RSC3 是后继者——块变换、快速 MDCT、均匀 scalefactor band、反�
 threshold 分配比特，已有容器 / 编码器 / 解码器，但解码器还是 Python，所以还没上 Roblox。
 
 - 语言：Python 3.12（`.python-version`），Roblox 侧 Luau
-- 数值：`numpy`、`scipy`、`librosa`、`tqdm`；`numba`（可用但原型里目前未使用）、`sounddevice`（监听播放）
+- 数值：`numpy`、`scipy`、`librosa`、`tqdm`；`numba`（解码器的位级步进走 JIT，见 `rsc3_bits.py`）、`sounddevice`（监听播放）
 - 工程：扁平脚本集合，**不是可安装包**（`pyproject.toml` 里 `[tool.uv] package = false`），没有构建步骤
 - 无 Web 框架、无 API Key、无数据库；仓库自己声明 "Vibe Coded"，README 的随意语气不代表代码可以随意
 
@@ -40,6 +40,10 @@ uv run python test_stream.py        # 语法 + 声音一致性回归（对比 _r
 uv run python test_roundtrip.py     # encode -> file -> decode，两个 CLI 不许不一致
 uv run python transform_check.py    # 变换自己的证明：kernel 匹配 + 全信号 OLA
 uv run python perf_check.py         # 改了性能/语法之后必跑；--bless 重建基线
+
+# 想验证 "编译过的路径 = 同一套语法"，用这个开关，别改代码：
+RSC3_NO_JIT=1 uv run python rsc3_decode.py input.rsc3 -o a.wav   # 纯 Python 步进
+uv run python rsc3_decode.py input.rsc3 -o b.wav                 # JIT 步进，两遍应当逐样本相同
 
 # 度量
 uv run python gainfit_es.py         # 拟合增益后的 ES（两个数都打）
