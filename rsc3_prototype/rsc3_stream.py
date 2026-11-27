@@ -1308,6 +1308,21 @@ def shape_cost(field):
 # chunks so a Luau port never holds the whole integer in one bit32 op. K stops at 64
 # because that is already more pulses than a 16-bin band can usefully spend.
 PVQ_K_MAX = 64
+# How far the tables go, as distinct from how far a band is allowed to reach unless it is told
+# to. The index of a K-pulse vector is the whole cost of K, so K is not free and the cap is a
+# rate decision rather than a size limit - but the tables are what make a named K decodable at
+# all, and every K an old file can name is already inside this, which is why raising the ceiling
+# for a new encode cannot make an old file decode differently.
+#
+# It was worth asking whether 64 is the wrong cap, and it is not. Widening it to 128 and 256 was
+# measured on moz.wav: nothing at all changes at 12 or 24 kbit/s, and at 64 kbit/s it buys
+# 20.30 -> 20.57 dB for 1% more bytes, which is a wash. Taking it *down* is what moves, ES
+# dropping from 20.30 to 18.91 at 32 pulses and to 15.68 at 16, so the marginal pulse is worth
+# roughly what its index costs right up to about 64 and not much past that. That is what the
+# rule in pvq_k_for_depth already says, which is the reason it is written as a budget and not a
+# constant: the encoder is choosing K the way it chooses depth, and on this material both land
+# on the same number.
+PVQ_K_TABLE = 256
 _PVQ_N = 16
 _PVQ_COUNT = {}
 
@@ -1330,7 +1345,7 @@ def _pvq_tables(n_max, k_max):
     return tab, bits
 
 
-_PVQ_TAB, _PVQ_BITS = _pvq_tables(_PVQ_N, PVQ_K_MAX)
+_PVQ_TAB, _PVQ_BITS = _pvq_tables(_PVQ_N, PVQ_K_TABLE)
 
 # The same table as one numpy integer array, clamped to the bound a walk's index is checked
 # against, so a compiled walk can hold the whole search in int64. A count larger than the bound
@@ -1338,10 +1353,10 @@ _PVQ_TAB, _PVQ_BITS = _pvq_tables(_PVQ_N, PVQ_K_MAX)
 # true count as well, so every comparison lands in the same place, and a count that large is
 # never the one subtracted.
 _PVQ_BOUND = 1 << 62
-_PVQ_CNT = np.zeros((_PVQ_N + 1, PVQ_K_MAX + 1), np.int64)
-_PVQ_NBITS = np.zeros((_PVQ_N + 1, PVQ_K_MAX + 1), np.int64)
+_PVQ_CNT = np.zeros((_PVQ_N + 1, PVQ_K_TABLE + 1), np.int64)
+_PVQ_NBITS = np.zeros((_PVQ_N + 1, PVQ_K_TABLE + 1), np.int64)
 for _n in range(_PVQ_N + 1):
-    for _k in range(PVQ_K_MAX + 1):
+    for _k in range(PVQ_K_TABLE + 1):
         _v = _PVQ_TAB[_n][_k]
         _PVQ_CNT[_n, _k] = _v if _v.bit_length() <= 62 else _PVQ_BOUND
         _PVQ_NBITS[_n, _k] = _PVQ_BITS[_n][_k]
@@ -1359,7 +1374,7 @@ def pvq_count(n, k):
     n, k = int(n), int(k)
     if k < 0 or n <= 0:
         return 0
-    if n <= _PVQ_N and k <= PVQ_K_MAX:
+    if n <= _PVQ_N and k <= PVQ_K_TABLE:
         return _PVQ_TAB[n][k]
     hit = _PVQ_COUNT.get((n, k))
     if hit is not None:
@@ -1539,7 +1554,7 @@ def _pvq_shape_fast(index, n, k):
     index = int(index)
     n = int(n)
     k = int(k)
-    if (_BITS.pvq_walk is not None and 1 <= n <= _PVQ_N and 0 <= k <= PVQ_K_MAX
+    if (_BITS.pvq_walk is not None and 1 <= n <= _PVQ_N and 0 <= k <= PVQ_K_TABLE
             and index.bit_length() <= 62):
         return _BITS.pvq_walk(_PVQ_CNT, index, n, k)
     return np.asarray(_pvq_shape(index, n, k), np.int64)
@@ -1604,7 +1619,7 @@ def pvq_k_for_depth(b, width, k_cap=0):
     if b <= 0 or width <= 0:
         return 0
     shape_bits = width * b
-    k_hi = PVQ_K_MAX if not k_cap else min(PVQ_K_MAX, max(int(k_cap), 1))
+    k_hi = PVQ_K_MAX if not k_cap else min(PVQ_K_TABLE, max(int(k_cap), 1))
     bits_row = _PVQ_BITS[width] if 0 < width <= _PVQ_N else None
     best = 1
     for k in range(1, k_hi + 1):
@@ -1623,13 +1638,12 @@ def _k_vec(b, width, k_cap):
     if int(width) != _PVQ_N:
         return np.array([pvq_k_for_depth(int(v), width, k_cap) for v in b], np.int64)
     bits = np.asarray(_PVQ_BITS[int(width)], np.int64)
-    gamma = np.array([_gamma_bits(k) for k in range(PVQ_K_MAX + 1)], np.int64)
+    gamma = np.array([_gamma_bits(k) for k in range(PVQ_K_TABLE + 1)], np.int64)
     cost = gamma + bits
     shape_bits = np.int64(width) * b
     ok = cost[None, :] <= shape_bits[:, None]
     ok[:, 0] = False
-    if k_cap:
-        ok[:, int(k_cap) + 1:] = False
+    ok[:, (PVQ_K_MAX if not k_cap else min(int(k_cap), PVQ_K_TABLE)) + 1:] = False
     return np.where(b > 0, ok.sum(axis=1), 0).astype(np.int64)
 
 
@@ -2225,7 +2239,7 @@ def read_frame(r, prev_E, prev_bits, width, fill=False, shape=False, reg=None,
             got = -1
             if _BITS.pvq_band is not None:
                 k_p, qv, idx, got = _BITS.pvq_band(r.bitbuf(), r.tell(), wq, _PVQ_NBITS,
-                                                   width, PVQ_K_MAX)
+                                                   width, PVQ_K_TABLE)
             if got < 0:
                 # The band is outside what the compiled form reads: no compiler, a pulse count
                 # the table does not hold, or an index wider than 64 bits. All rare, and the

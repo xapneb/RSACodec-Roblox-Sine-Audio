@@ -353,5 +353,32 @@ else:
     check("the band read agrees bit for bit", bad == 0,
           f"300 bands, wide indices declined to the reference path")
 
+    # and a band that names more pulses than the old ceiling. Both the index and the codebook
+    # size leave 64 bits there, which is the case the compiled walk declines and the tables are
+    # built to hold, so what has to hold is that the band written is the band that comes back.
+    wide = 0
+    for _ in range(60):
+        k = int(rng.integers(cur.PVQ_K_MAX + 1, cur.PVQ_K_TABLE + 1))
+        n = 16
+        y = np.zeros(n, np.int64)
+        # one pulse at a time, and always in the direction the bin is already going: a pulse
+        # dropped against a bin's own sign shrinks it, and then L1 is not k any more and the
+        # index is not in the codebook the writer is quoting.
+        for _ in range(k):
+            j = int(rng.integers(0, n))
+            y[j] += 1 if (y[j] >= 0 or rng.random() < 0.5) else -1
+        if int(np.abs(y).sum()) != k:
+            continue
+        wq = int(rng.integers(1, 7))
+        q = int(rng.integers(0, 1 << wq))
+        wf = cur.Writer()
+        cur.write_pvq_bands(wf, [(q, y)], (wq,))
+        rr = cur.Reader(wf.done())
+        want = cur.pvq_synth_band(y, q, 0, wq)
+        back = cur.read_pvq_band(rr, n, 0, wq)
+        wide += int(np.array_equal(back, want))
+    check("a band past the old pulse ceiling round-trips", wide >= 45,
+          f"{wide} bands at K above {cur.PVQ_K_MAX}, K up to {cur.PVQ_K_TABLE}")
+
 print("\n" + ("all checks passed" if not fails else f"{len(fails)} FAILED: {fails}"))
 sys.exit(1 if fails else 0)
