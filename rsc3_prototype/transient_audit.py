@@ -14,16 +14,16 @@ up; the ear is most exposed to it there, because nothing is masking anything yet
 30 to 140 ms that follow, which is where ringing and a smeared release live. Both want to be as
 far below zero as the material allows.
 
-Reference numbers, so the readings below mean something. A 6-second click train at 96 kbit/s, the
-shipped mask:
+Reference numbers, so the readings below mean something. A 6-second click train at 96 kbit/s,
+58 attacks found, with the mask as shipped:
 
     ES 10.70   at the hit -16.9   before -15.1   after -10.5
 
 with --temporal-mask 12 at the same rate:
 
-    ES 16.64   at the hit -27.6   before -21.3   after -16.4
+    ES 16.64   at the hit -27.9   before -21.3   after -16.4
 
-and a synthetic click is the hard case: a Dirac has every bin in the file to itself, which is
+and with --temporal-mask 12 at the same rate. A synthetic click is the hard case: a Dirac has every bin in the file to itself, which is
 exactly the frame a spectral mask declares fully masked. Real percussive material reads a few dB
 better than these. If "before" rises while "at the hit" falls, the fix is spending its bits in the
 wrong place.
@@ -57,12 +57,25 @@ def main(src_path, dec_path, step_s=0.1):
         s, d = s.mean(1), d.mean(1)
     e = s - d
     step = int(step_s * sr)
-    hits = [i for i in range(PRE[0], n - POST[1], step)
-            if (s[i - PRE[0]:i] ** 2).sum() < 1e-9 and (s[i:i + step // 4] ** 2).sum() > 1e-6]
-    if len(hits) < 8:
-        hits = [i for i in range(PRE[0], n - POST[1], step)]
-        print("   (no clean gaps found; measuring every fixed interval, which is not the same "
-              "thing and says so)")
+    # An attack is where the signal jumps out of what it was doing, so find it in the source and
+    # nothing else: a sample well above what the same moment looked like one millisecond ago, and
+    # above a fraction of the file's own level so the noise floor does not qualify as an onset.
+    k = max(int(0.001 * sr), 1)
+    a = np.abs(s)
+    held = np.concatenate([np.zeros(k), a[:-k]])
+    cand = np.nonzero((a > 8.0 * held) & (a > 0.05 * a.max()))[0]
+    hits, last = [], -step
+    for i in cand:
+        if i - last > max(int(0.010 * sr), 1) and PRE[0] <= i <= n - POST[1]:
+            hits.append(int(i))
+            last = i
+    spaced = len(hits) >= 8
+    if not spaced:
+        # Continuous material has no isolated attacks to measure, and pretending otherwise would
+        # print a number that looks like a transient result and is really just the steady state.
+        hits = list(range(PRE[0], n - POST[1], step))
+        print("   no isolated attacks found; these rows describe the steady state, not an onset")
+    tot = np.zeros(3)
     tot = np.zeros(3)
     for i in hits:
         t = (s[i - PRE[1]:i + step] ** 2).sum() + 1e-30
@@ -71,7 +84,7 @@ def main(src_path, dec_path, step_s=0.1):
         tot[2] += (e[i + POST[0]:i + POST[1]] ** 2).sum() / t
     k = max(len(hits), 1)
     es = 10 * np.log10((s ** 2).sum() / ((e ** 2).sum() + 1e-30))
-    print(f"{src_path} -> {dec_path}: {k} hits measured   ES {es:6.2f} dB")
+    print(f"{src_path} -> {dec_path}: {len(hits)} hits measured   {"(spaced attacks)" if spaced else "(interval sweep)"}   ES {es:6.2f} dB")
     print(f"   at the hit {10*np.log10(tot[0]/k+1e-30):7.1f} dB   "
           f"in the 40 ms BEFORE {10*np.log10(tot[1]/k+1e-30):7.1f} dB   "
           f"in the 30-140 ms AFTER {10*np.log10(tot[2]/k+1e-30):7.1f} dB")
