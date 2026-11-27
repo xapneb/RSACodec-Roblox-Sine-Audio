@@ -300,5 +300,58 @@ else:
           float(np.abs(enc_x - dec_x).max()) == 0.0,
           f"max diff {float(np.abs(enc_x - dec_x).max()):.1e}")
 
+# 7 ------------------------------------------------------------------ the compiled walk
+# The decoder has two ways to read the same pyramid band and they must not have two answers. One
+# is a loop over a count table in machine code, the other is the grammar as it was written, and
+# what makes the fast one safe is not that it is fast but that it lands on the same vector and
+# leaves the cursor at the same bit.
+try:
+    import rsc3_bits as bits
+except Exception:
+    bits = None
+if bits is None or bits.pvq_walk is None:
+    print("  SKIP  the compiled walk is the same walk: no compiler in this checkout")
+else:
+    import random
+    import numpy as np
+    rng = np.random.default_rng(20)
+    random.seed(20)
+    rows = []
+    for _ in range(400):
+        n = int(rng.integers(1, 17))
+        k = int(rng.integers(0, 40))
+        # random.randrange takes the whole codebook size, which is bigger than 64 bits at the
+        # wide end, and the walk has to be shown the whole range and not only the easy part.
+        idx = random.randrange(int(cur.pvq_count(n, k)))
+        rows.append((n, k, idx))
+    same = all(np.array_equal(np.asarray(cur._pvq_shape(i, n, k), np.int64),
+                              cur._pvq_shape_fast(i, n, k)) for n, k, i in rows)
+    check("the compiled walk is the same walk", same, f"{len(rows)} bands, 1 to 16 wide")
+
+    # and the band read, which is the part that has a cursor to keep: the compiled form has to
+    # come back with the same three numbers and the same position, or the next field is wrong.
+    bad = 0
+    for _ in range(300):
+        k = int(rng.choice([1, 2, 3, 8, 17, 32, 34, 64]))
+        ncode = int(cur.pvq_count(16, k))
+        nbits = (ncode - 1).bit_length() if ncode > 1 else 0
+        idx = random.randrange(ncode) if ncode > 1 else 0
+        wq = int(rng.integers(0, 7))
+        q = int(rng.integers(0, 1 << wq)) if wq else 0
+        z = k.bit_length() - 1
+        w = cur.Writer()
+        w.put((k << wq) | q, 2 * z + 1 + wq)
+        cur._put_wide(w, idx, nbits)
+        pay = w.done()
+        fast = bits.pvq_band(np.frombuffer(pay, np.uint8), 0, wq, cur._PVQ_NBITS, 16, cur.PVQ_K_MAX)
+        rr = cur.Reader(pay)
+        slow = (cur._read_gamma(rr), rr.get(wq), rr.get(nbits) if nbits else 0, rr.tell())
+        if nbits <= 62 and (fast[:3], fast[3]) != (slow[:3], slow[3]):
+            bad += 1
+        if nbits > 62 and fast[3] != -1:
+            bad += 1        # the wide index has to be declined, not truncated into 64 bits
+    check("the band read agrees bit for bit", bad == 0,
+          f"300 bands, wide indices declined to the reference path")
+
 print("\n" + ("all checks passed" if not fails else f"{len(fails)} FAILED: {fails}"))
 sys.exit(1 if fails else 0)

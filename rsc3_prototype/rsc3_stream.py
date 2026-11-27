@@ -46,6 +46,8 @@ import struct
 
 import numpy as np
 
+import rsc3_bits as _BITS     # the compiled form of the one sequential step, when it is available
+
 MAGIC = b"RSC3"
 VERSION = 1
 MAX_BITS = 16
@@ -284,6 +286,18 @@ class Reader:
         self.i = 0
         self.acc = 0
         self.n = 0
+        self._arr = None
+
+    def bitbuf(self):
+        """The payload as a byte array, made once per reader.
+
+        np.frombuffer does not copy, and the compiled walker wants an array rather than the
+        bytes object itself, so this is built the first time a field is handed off and reused for
+        every field after it.
+        """
+        if self._arr is None:
+            self._arr = np.frombuffer(self.d, np.uint8)
+        return self._arr
 
     def _fill(self, w):
         acc, n, i = self.acc, self.n, self.i
@@ -309,6 +323,39 @@ class Reader:
         self.n = n
         self.acc = self.acc & ((1 << n) - 1) if n else 0
         return v
+
+    def tell(self):
+        """The absolute bit offset of the next bit.
+
+        The reservoir holds `n` bits of what starts at byte `i`, so the run it has not consumed
+        begins at `i * 8 - n` wherever that happens to be, and a compiled walker handed the
+        payload can start from exactly there.
+        """
+        return self.i * 8 - self.n
+
+    def seek(self, pos):
+        """Put the cursor at an absolute bit offset and rebuild the reservoir around it.
+
+        Only whole bytes before `pos` count as consumed, so the tail of the byte `pos` lands in
+        goes back into the accumulator rather than being read twice. It is the same state the
+        reader would have reached one `get` at a time, which is the whole reason a field can be
+        handed off and the field after it picked up normally.
+
+        The tail is the *low* bits of that byte, because a byte is consumed from the top, and the
+        reader's own invariant is that the next bit is the high bit of an accumulator holding
+        exactly `n` bits. Reading that the other way round leaves the field's own symbols right
+        and the field after it wrong, which is the worst failure this could have: the numbers in
+        the middle look fine and the ones at the end do not.
+        """
+        i = (pos + 7) >> 3
+        n = (i << 3) - pos
+        self.i = i
+        self.n = n
+        if n:
+            b = self.d[i - 1] if 0 < i <= self.L else 0
+            self.acc = b & ((1 << n) - 1)
+        else:
+            self.acc = 0
 
     def take(self, w):
         """The next `w` bits as one integer, MSB first. Same bits `get` would return, one call."""
@@ -464,7 +511,17 @@ def scatter(buf, vals, widths, at):
 
 def read_rice(r, n, k):
     """Rice(k) with no bound on the quotient: a corrupted stream reads on to the end of the
-    buffer rather than failing early, so callers must not feed this arbitrary bytes."""
+    buffer rather than failing early, so callers must not feed this arbitrary bytes.
+
+    The compiled walker takes the field when there is enough of it to be worth the handoff, and
+    the per-symbol walk below is what runs without the JIT. Both paths read the same bits, and
+    the bit offset the walker returns is where the reader would have ended up symbol by symbol,
+    so the field that follows does not care which way this one was read.
+    """
+    if _BITS.rice_decode is not None and n >= 8:
+        vals, pos = _BITS.rice_decode(r.bitbuf(), r.tell(), n, k)
+        r.seek(pos)
+        return vals
     out = np.empty(n, np.int64)
     if k:
         for i in range(n):
@@ -1257,6 +1314,20 @@ def _pvq_tables(n_max, k_max):
 
 _PVQ_TAB, _PVQ_BITS = _pvq_tables(_PVQ_N, PVQ_K_MAX)
 
+# The same table as one numpy integer array, clamped to the bound a walk's index is checked
+# against, so a compiled walk can hold the whole search in int64. A count larger than the bound
+# becomes the bound, and that is exact rather than close: an index below the bound is below the
+# true count as well, so every comparison lands in the same place, and a count that large is
+# never the one subtracted.
+_PVQ_BOUND = 1 << 62
+_PVQ_CNT = np.zeros((_PVQ_N + 1, PVQ_K_MAX + 1), np.int64)
+_PVQ_NBITS = np.zeros((_PVQ_N + 1, PVQ_K_MAX + 1), np.int64)
+for _n in range(_PVQ_N + 1):
+    for _k in range(PVQ_K_MAX + 1):
+        _v = _PVQ_TAB[_n][_k]
+        _PVQ_CNT[_n, _k] = _v if _v.bit_length() <= 62 else _PVQ_BOUND
+        _PVQ_NBITS[_n, _k] = _PVQ_BITS[_n][_k]
+
 
 def pvq_claims(b):
     """Every live band. Those are the ones whose scalar mantissas are not in the file.
@@ -1439,8 +1510,25 @@ def _pvq_shape(index, n, k):
             return out
 
 
+def _pvq_shape_fast(index, n, k):
+    """The pyramid walk, as int64 coordinates from the top bin down.
+
+    A real stream asks for this a quarter of a million times per decode, and almost every ask is
+    inside what the table and a 64-bit index cover, so the check is worth its cost: a width the
+    table was built for, a pulse count it holds, an index under the bound. Beyond that the big
+    integers are genuinely big and the reference walk is what answers.
+    """
+    index = int(index)
+    n = int(n)
+    k = int(k)
+    if (_BITS.pvq_walk is not None and 1 <= n <= _PVQ_N and 0 <= k <= PVQ_K_MAX
+            and index.bit_length() <= 62):
+        return _BITS.pvq_walk(_PVQ_CNT, index, n, k)
+    return np.asarray(_pvq_shape(index, n, k), np.int64)
+
+
 def pvq_from_index(index, n, k):
-    return np.asarray(_pvq_shape(int(index), int(n), int(k))[::-1], np.int64)
+    return _pvq_shape_fast(int(index), int(n), int(k))[::-1]
 
 
 def pvq_synth_band(y, q, E, b):
@@ -2094,6 +2182,11 @@ def read_frame(r, prev_E, prev_bits, width, fill=False, shape=False, reg=None,
                 row[i] = -(v & lim) if (v >> bw) else (v & lim)
             continue
         n = r.get(cb)
+        if _BITS.gap_decode is not None and n >= 4:
+            vals, at, pos = _BITS.gap_decode(r.bitbuf(), r.tell(), n, gb, step, bw)
+            r.seek(pos)
+            mant[j, at] = vals
+            continue
         base = -1
         for _ in range(n):
             i = base + 1 + r.get(gb)
@@ -2110,11 +2203,23 @@ def read_frame(r, prev_E, prev_bits, width, fill=False, shape=False, reg=None,
         es = []
         bs = []
         for j in np.flatnonzero(claims):
-            k_p = _read_gamma(r)
-            qv = r.get(int(b[j]))
-            ncode = pvq_count(width, k_p)
-            nbits = (ncode - 1).bit_length() if ncode > 1 else 0
-            rows.append(_pvq_shape(r.get(nbits) if nbits else 0, width, k_p)[::-1])
+            wq = int(b[j])
+            got = -1
+            if _BITS.pvq_band is not None:
+                k_p, qv, idx, got = _BITS.pvq_band(r.bitbuf(), r.tell(), wq, _PVQ_NBITS,
+                                                   width, PVQ_K_MAX)
+            if got < 0:
+                # The band is outside what the compiled form reads: no compiler, a pulse count
+                # the table does not hold, or an index wider than 64 bits. All rare, and the
+                # cursor never moved, so this is the grammar read the way it always was.
+                k_p = _read_gamma(r)
+                qv = r.get(wq)
+                ncode = pvq_count(width, k_p)
+                nbits = (ncode - 1).bit_length() if ncode > 1 else 0
+                idx = r.get(nbits) if nbits else 0
+            else:
+                r.seek(got)
+            rows.append(_pvq_shape_fast(idx, width, k_p)[::-1])
             qs.append(qv)
             es.append(int(E[j]))
             bs.append(int(b[j]))
