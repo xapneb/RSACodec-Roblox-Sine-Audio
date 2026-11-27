@@ -82,6 +82,24 @@ _MS_SCALE = float(np.sqrt(0.5))
 # its own. The region is derived from the header, so moving SHAPE_F0 or SHAPE_BLOCK changes
 # the bitstream of every file that sets the flag. The flatness and depth knees do too, but
 # only the codes move; the grammar does not.
+# Two things were tried against this field and both lost, so they are written down where the next
+# person looking for a cheaper shape field will find them rather than in a commit message.
+#
+# The first is a predicted shape field: one gain and one slope per run, then an exception for every
+# block that misses the line by more than T code units. The intuition was that the levels are a
+# smooth curve, and they are, but a line does not beat what the field already does to that curve.
+# Priced as the writer would price it (_shape_line.py): on beep.wav at 24 kbit/s it is 156 bit per
+# frame against 136, at 10 kbit/s 133 against 120, and on a sine, where a run has almost nothing
+# to say, 46 against 8. The exception form is worse at every threshold, including the one that
+# reproduces the field exactly, because the delta stream it replaces already charges k+1 bits to
+# say "same", which is close to free, while an exception has to say *where* it is first.
+#
+# The second is the frequency-dependent block width, which is the part of the same intuition that
+# can be built: the shape above the crossover is nearly inaudible to be wrong about, so the fine
+# words down here might not need to be fine. They cost what they cost either way (_shape_split.py:
+# moz.wav 102 bit/frame and 8.72 dB at the 90th percentile for two bands below 8 kHz and eight
+# above, against 104 and 8.77 for four everywhere) - a couple of bits and no error, so the same
+# curve a dial wider to the left. The width was never the lever, and nothing above SHAPE_F0 is.
 SHAPE_FLAG = 2
 SHAPE_F0 = 2000.0
 # Header bits 5 and 6 carry how wide a shape word is: the field is log2(block / SHAPE_BLOCK),
