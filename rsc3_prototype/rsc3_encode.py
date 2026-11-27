@@ -403,6 +403,12 @@ def main():
                          "there. Measured per file, not a fixed pad. 0 leaves the level alone")
     ap.add_argument("--blind", action="store_true",
                     help="disable frequency masking; bits follow level against a flat floor")
+    ap.add_argument("--temporal-mask", type=float, default=0.0, metavar="DB", dest="temporal",
+                    help="lower the mask DB on a frame that just took a step up in energy, and on "
+                         "the frame leading into it, so a transient is allowed to buy bits the "
+                         "frame's own masking would have refused it. 0 (default) is the shipped "
+                         "mask, and an old file's decisions stay reproducible. Encoder only: "
+                         "nothing about it reaches the stream")
     ap.add_argument("--fill", dest="fill", action="store_true", default=True,
                     help="fill dead bands with level-coded noise (default, and the default rate "
                          "the header says)")
@@ -474,6 +480,7 @@ def main():
     phase = ["encode"]
 
     psycho = not args.blind
+    r3.TEMPORAL_MASK = float(args.temporal)
     if args.ms is None:
         args.ms = nch == 2
     if args.ms and nch != 2:
@@ -573,6 +580,7 @@ def main():
           + (f", signal-shaped noise above {st.SHAPE_F0 / 1e3:.0f} kHz" if args.fill_shape else "")
           + (", pyramid vectors on every live band" if args.pvq else "")
           + (", mid/side where that split is quieter" if ms_rows is not None else "")
+          + (f", mask lifted {args.temporal:.0f} dB into an attack" if args.temporal else "")
           + (f", shape words span {sblock} bands"
              if args.fill_shape and sblock != st.SHAPE_BLOCK else ""))
     # The fields must add up to the bytes. Attributed bits can only differ from the file by
