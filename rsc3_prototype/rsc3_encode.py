@@ -76,7 +76,7 @@ def _field_bits(A, sr, budget, A_db, thr, fill, shape, mode, pvq=False, ms=None,
     if fill:
         cap_thr = thr.reshape(nfr, nb, WIDTH) if mode == "safe" else None
         caps = st.band_fill_cap(A3, cap_thr)
-        fills = [st.run_fill_words(caps[f], bits[f], mode) for f in range(nfr)]
+        fills = st.run_fill_words_all(caps, bits, mode)
     if shape:
         reg = st.shape_reg(sr, nc * 2, WIDTH)
         energy = st.band_fill_cap(A3, None)
@@ -340,6 +340,10 @@ def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe
     energy = st.band_fill_cap(A3, None) if shape else None
     reg = st.shape_reg(sr, 2 * nc, WIDTH) if shape else None
     shapes = st.shape_window(energy, bits, reg, sblock) if shape else None
+    # The fill words are a pure function of this frame's dead runs and its own ceilings, so
+    # they can be computed for every frame before the loop instead of inside it. Nothing here
+    # decides anything: it is the same level and slope the per-frame call would have returned.
+    words_all = st.run_fill_words_all(caps, bits, mode) if fill else None
     recon = np.zeros((nfr, nc)) if build_recon else None
     w = st.Writer()
     prev_E = np.zeros(nb, np.int64)
@@ -350,7 +354,7 @@ def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe
         b = bits[f]
         E = E_all[f]
         mant = M_all[f]
-        words = st.run_fill_words(caps[f], b, mode) if fill else None
+        words = words_all[f] if fill else None
         sf = shapes[f] if shape else None
         recs = None
         pulses = None
