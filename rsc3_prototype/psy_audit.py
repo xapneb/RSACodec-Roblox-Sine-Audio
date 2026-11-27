@@ -13,28 +13,43 @@ only part a listener can hear, and a working model is expected to trade the firs
 second: it should look *worse* on plain error and better on audible error, and if it does neither
 then the mask is not doing anything.
 
-What this tool proves and what it cannot:
+Read the scale before the numbers. Lower "audible" is better, and the bottom of what is available
+is 43.7 dB, which is what this codec scores if it codes nothing at all. A row read without that
+anchor says "4 dB" and turns out to be a third of the range.
 
-  Proven here, on moz.wav at 24 kbit/s, 1500 frames, 1023 bits per frame:
-    masking             1024 b/f   plain -59.6 dB   audible 31.77 dB
-    global floor, -50 dB  1023 b/f   plain -66.7 dB   audible 33.95 dB
-    blind, level only     1024 b/f   plain -65.0 dB   audible 34.54 dB
-  The mask changes the decision on about 30% of coefficients and buys 2.8 dB of audible error for
-  5.5 dB of plain SNR, and a single global floor only buys 0.6 dB of that, so the ERB skirts are
-  earning the rest. On tone material the whole effect shrinks to under 1 dB, so it is material
-  dependent and this is not a number to carry between files.
+On moz.wav at 24 kbit/s, 1023 bits per frame:
 
-  Also measured, and the reason the arms are chosen rather than swept: a mask that is too strong
-  for the codec to spend stops being a mask and becomes a rate limit. Taking everything 20 dB
-  below the frame's loudest bin and calling it hidden starves the allocator until no budget,
-  however large, reaches the target - it tops out near 100 bits per frame and the rest goes
-  unspent. So masking strength is bounded above by the allocator's ability to buy something, and
-  that ceiling is a good deal lower than the point where the curve looks best on paper.
+    coding nothing       0 b/f   plain -50.0 dB   audible 43.71   <- nothing coded, the ceiling
+    masking           1024 b/f   plain -59.6 dB   audible 31.77   <- what ships
+    blind             1024 b/f   plain -65.0 dB   audible 34.54
+    floor -75         1023 b/f   plain -67.6 dB   audible 33.82
+    peak -20           104 b/f   plain -58.8 dB   audible 34.78   <- cannot spend the rate
 
-  Not measured: whether the mask is the right *strength*. The score here is the shipped model, so
-  asking it to judge a stronger or weaker mask is that model grading its own homework. The
-  structural claim (skirts over a single floor) survives that; the parameters - the 15% and the
-  10/25 dB per ERB - do not, and they want ears rather than another hour of arithmetic.
+The mask changes the decision on about a third of the coefficients and buys 2.8 dB of audible error
+for 5.5 dB of plain SNR, which is the trade a mask exists to make. Tone material shrinks all of it
+below a decibel, so this is not a number to carry from one file to another.
+
+Two corrections are written into the arms themselves.
+
+The arms first shipped under the name "global" were peak-relative, which is the wrong way to write
+a mask with no frequency structure: one loud bin in a frame buys a threshold that covers the frame's
+own floor and nothing else, so that arm coded about two percent of what it was asked to and landed
+closer to silence than to the codec. They are called "peak" now, for what they are. The honest
+arm without frequency structure is an absolute floor, and that one is better than it first looks.
+
+The other one is about rate, and it is the reason this tool exists. "Cannot spend the rate" is not
+a quirk of one over-aggressive mask. An absolute floor saturates too, for a reason that has nothing
+to do with how loud the mask is set: the price ladder only holds so many prices above that floor,
+so at 96 kbit/s a -75 arm hands back 1778 of 4094 bits and stops improving on its own, while the
+shipped mask spends every bit and reaches 14.02 dB against the same ceiling. What lets the shipped
+mask scale is the part of it that falls away - the quiet tail where no masker reaches and the
+threshold drops toward -120 dBFS, giving the ladder somewhere left to buy. A model with a tidy flat
+floor would look fine at 24 kbit/s and quietly give up on every rate above it.
+
+Not measured, and not measurable this way: whether the mask is the right *strength*. The score is
+the shipped model, so any stronger or weaker arm is graded by the thing under test. The structural
+claim, that skirts beat any single level, stands; the 15 percent and the 10 and 25 dB per ERB want
+listening rather than another hour of arithmetic.
 
 Two things to hold about what is being compared:
 
@@ -58,11 +73,22 @@ from scipy.io import wavfile
 FRAMES = 1500
 
 
-def global_mask(band, nc, k):
-    """A mask that knows nothing but the frame's loudest bin: everything k dB under it is hidden.
-    What a model without frequency structure would have to say."""
+def peak_mask(band, nc, k):
+    """Everything k dB under the frame's loudest bin is hidden. This is what a model without
+    frequency structure looks like when it is written the obvious way, and the obvious way is
+    wrong: it scales with the loudest sample, so a single loud bin buys the frame a mask that
+    covers nothing the frame actually contains, and it is the reason the -20 and -35 rows below
+    mute the file rather than coding it. A model that cannot spend the rate is not a mask, it is
+    an off switch."""
     m = (band.max(axis=1) - k)[:, None] * np.ones((1, nc))
     return np.maximum(m, r3.QUIET_FLOOR_DBFS)
+
+
+def floor_mask(band, k):
+    """A global model that is not absurd: a level that does not move with the frame's peak, which
+    is what a quiet-audio floor actually is. This one can spend, so it is the fair thing to compare
+    the skirts against - a mask that knows about loudness and nothing about frequency."""
+    return np.full(band.shape, float(k))
 
 
 def main(path, br=24, nframes=FRAMES):
@@ -78,9 +104,10 @@ def main(path, br=24, nframes=FRAMES):
     band = r3._band_level_db(A_db, r3.band_edges(nc))
     masks = {"masking": r3.threshold_dbfs(A_db, sr, nc, psycho=True),
              "blind": r3.threshold_dbfs(A_db, sr, nc, psycho=False),
-             "global -20": global_mask(band, nc, 20.0),
-             "global -35": global_mask(band, nc, 35.0),
-             "global -50": global_mask(band, nc, 50.0)}
+             "peak -20": peak_mask(band, nc, 20.0),
+             "peak -50": peak_mask(band, nc, 50.0),
+             "floor -60": floor_mask(band, -60.0),
+             "floor -75": floor_mask(band, -75.0)}
     score_mask = masks["masking"]
     target = int(br * 1000.0 * hop / sr)
 
@@ -100,6 +127,10 @@ def main(path, br=24, nframes=FRAMES):
     print(f"{path} {br} kbit/s: {nfr} frames, {nc} coefficients, {target} bits/frame "
           f"scored against the shipped mask")
     got = {}
+    mute = np.zeros_like(A_db)
+    bits, err, over = score(mute)
+    print(f"   coding nothing     {bits:7.1f} bit/frame   plain {err:8.2f} dB   audible "
+          f"{over:7.2f} dB   <- the whole signal is the error, this is the top of the scale")
     for name, thr in masks.items():
         lo, hi = 8.0, 16384.0
         for _ in range(20):
