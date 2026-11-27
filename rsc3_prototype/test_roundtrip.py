@@ -85,25 +85,62 @@ def one(src, kbps, n2=4096, extra=(), mode="safe", tag=""):
     # that assumed it would be testing a decoder that only works when someone tells it.
     with open(os.path.join(HERE, tmp), "rb") as f:
         # HEADER_SIZE alone is not enough: unpack_header also reads the per-payload length
-        # table that follows it, so this reads a window, not the whole file.
-        flags = st.unpack_header(f.read(st.HEADER_SIZE + 64))["flags"]
+        # table that follows it, and the playback gain when the file carries one.
+        hdr = st.unpack_header(f.read(st.HEADER_SIZE + 64))
+    flags = hdr["flags"]
+    gain = hdr["gain"]
     fill = bool(flags & st.FILL_FLAG)
     shape = bool(flags & st.SHAPE_FLAG)
+    pvq = bool(flags & st.PVQ_FLAG)
+    cap = 0
+    if "--pvq-cap" in extra:
+        cap = int(extra[extra.index("--pvq-cap") + 1])
     n_samp = x.shape[0]
+    width = hdr["width"]
+    nch_x = x.shape[1]
+    As = [r3.amplitude(r3.analyse(x[:, c], n2)[0], n2) for c in range(nch_x)]
+    ms = bool(flags & st.MS_FLAG)
+    mask = None
+    if ms:
+        if nch_x != 2:
+            FAILS.append(f"{src}@{kbps}: mid/side flag on {nch_x} channels")
+        else:
+            mask = enc.ms_mask(As[0], As[1], width)
+            if not np.any(mask):
+                FAILS.append(f"{src}@{kbps}: mid/side flag set with an empty mask")
+                mask = None
+            else:
+                As[0], As[1] = st.ms_rotate(As[0], As[1], mask, width)
+    recons, decs = [], []
+    got_mask = None
+    for c in range(nch_x):
+        p, rc = enc.encode_channel(As[c], sr, budget, psycho=True, fill=fill, mode=mode,
+                                   shape=shape, pvq=pvq, pvq_cap=cap,
+                                   ms=(mask if ms and c == 0 else None))
+        if ms and c == 0:
+            X, got_mask = dec.decode_channel(p, As[c].shape[0], n2, width, fill=fill,
+                                             shape=shape, sr=sr, pvq=pvq, ms=True)
+        else:
+            X = dec.decode_channel(p, As[c].shape[0], n2, width, fill=fill, shape=shape,
+                                   sr=sr, pvq=pvq)
+        recons.append(rc)
+        decs.append(X)
+    if mask is not None and got_mask is not None:
+        if got_mask.shape != mask.shape or not np.array_equal(got_mask, mask):
+            FAILS.append(f"{src}@{kbps}: mid/side mask did not survive the payload")
+        recons[0], recons[1] = st.ms_unrotate(recons[0], recons[1], mask, width)
+        decs[0], decs[1] = st.ms_unrotate(decs[0], decs[1], got_mask, width)
     enc_stack, q_stack = [], []
-    for c in range(x.shape[1]):
-        A = r3.amplitude(r3.analyse(x[:, c], n2)[0], n2)
-        p, rc = enc.encode_channel(A, sr, budget, psycho=True, fill=fill, mode=mode,
-                                   shape=shape)
-        y_enc = r3.synthesise(rc * (n2 / 4.0), n2, n_samp)
-        X = dec.decode_channel(p, A.shape[0], n2, 16, fill=fill, shape=shape, sr=sr)
-        y_dec = r3.synthesise(X * (n2 / 4.0), n2, n_samp)
+    for c in range(nch_x):
+        y_enc = r3.synthesise(recons[c] * (n2 / 4.0), n2, n_samp)
+        y_dec = r3.synthesise(decs[c] * (n2 / 4.0), n2, n_samp)
         if float(np.abs(y_enc - y_dec).max()) != 0.0:
             FAILS.append(f"{src}@{kbps} ch{c}: decoded coefficients differ by "
                          f"{float(np.abs(y_enc - y_dec).max()):.3e}")
-        # and the file must be exactly the rounded reconstruction, so that the only difference
-        # left is 16-bit, whose cost is then measured below rather than assumed
-        q = np.clip(np.round(y_enc * 32767.0), -32768.0, 32767.0) / 32768.0
+        # The file is the reconstruction times the playback gain, then rounded. The gain is
+        # 1 unless the synthesis crossed the ceiling, and the wav has to follow it or a hot
+        # file looks like a broken decoder.
+        q = np.clip(np.round(y_enc * gain * 32767.0), -32768.0, 32767.0) / 32768.0
         if not np.array_equal(np.round(y[:n_samp, c] * 32768.0), np.round(q * 32768.0)):
             FAILS.append(f"{src}@{kbps} ch{c}: wav is not the rounded reconstruction")
         enc_stack.append(y_enc)
@@ -182,6 +219,13 @@ for src, br in (("cam15.wav", 10), ("ij15.wav", 10)):
     except Exception as e:
         FAILS.append(f"{src}@{br} shape: {e}")
         print(f"  {src}  target {br} shape   *** {str(e)[:200]}")
+# The flag-clear path has to keep reconstructing with no mask in the payload. Default
+# stereo encodes set the flag, so this one asks for the old channels explicitly.
+try:
+    one("cam15.wav", 128, extra=("--no-ms",), tag="-noms")
+except Exception as e:
+    FAILS.append(f"cam15.wav@128 noms: {e}")
+    print(f"  cam15.wav  target 128 noms   *** {str(e)[:200]}")
 
 for f in os.listdir(HERE):
     if f.startswith("_rt_"):

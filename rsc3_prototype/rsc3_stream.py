@@ -50,16 +50,73 @@ MAGIC = b"RSC3"
 VERSION = 1
 MAX_BITS = 16
 FILL_FLAG = 1  # header flag bit 0: this stream carries a dead-band noise fill field
-# Header flag bit 1: dead bands above SHAPE_F0 also carry the shape field - one delta-coded
-# level word per block of SHAPE_BLOCK dead bands, riding on top of the fill. The measured case
-# for it is geometry: a dead run here is routinely ~120 bands wide, and one level plus one
-# STRAIGHT slope cannot follow a mask curve that is not straight, so the run lands far below what
-# its own bands could legally carry. _ceiling_probe.py measures that gap: median −21 dB in
-# 14-18 kHz on cam15, −42 dB on ij15. A different bit map is a new codec, so it gets a flag word,
-# not a tweak.
+# Header flag bit 2: a float32 playback gain follows the payload-length table. Quantizing a
+# waveform that is already on the rail reconstructs hot, and by how much is a property of
+# that waveform. A constant pad (the 6 dB one) still clips the next hotter file and quiets
+# every file that never crossed. The gain is ceiling/peak of the synthesis the decoder
+# plays, so the file sits on the rail and the quality figure is not charged for the offset.
+GAIN_FLAG = 4
+# Header flag bit 3: every live band is a pyramid vector instead of scalar mantissas.
+# The bit budget of each band is whatever its scalar field would have spent. A dead band
+# has no scalar field, so fill and shape still own it. A file with this bit clear has
+# no pyramid data.
+PVQ_FLAG = 8
+# Header flag bit 4: stereo frames may code a band as mid/side instead of left/right.
+# The mask is in channel 0 only, one decision for every MS_GROUP bands. A clear flag
+# is the old independent channels, byte for byte.
+MS_FLAG = 16
+MS_GROUP = 4
+_MS_SCALE = float(np.sqrt(0.5))
+# Header flag bit 1: dead bands above SHAPE_F0 carry the shape field. One delta-coded level
+# word per block of SHAPE_BLOCK dead bands, and the level is that block's own energy, not a
+# share of the mantissa budget. A low rate never opens those bands — the waterfill spends
+# every bit on the loud lows — and the flat fill cannot paint them either, because an
+# unmasked band's ceiling is the -120 floor, which decodes as silence. The noise is what
+# puts dense treble back. A code of 0 leaves the flat fill standing, and that is also how a
+# sparse block or a block that is only a little energy is sent: the decoder has no gate of
+# its own. The region is derived from the header, so moving SHAPE_F0 or SHAPE_BLOCK changes
+# the bitstream of every file that sets the flag. The flatness and depth knees do too, but
+# only the codes move; the grammar does not.
 SHAPE_FLAG = 2
-SHAPE_F0 = 14000.0
-SHAPE_BLOCK = 16
+SHAPE_F0 = 2000.0
+# Header bits 5 and 6 carry how wide a shape word is: the field is log2(block / SHAPE_BLOCK),
+# so a file that says nothing is the fine two-band stream, byte for byte, and every file made
+# before this field existed still decodes as it was made. The width is here rather than derived
+# from the rate so that a decoder reading a file does not have to want what the encoder wanted:
+# eight bands on a file that only meant two is a desync, not a difference of opinion, and the
+# drift check catches that far too late to be cheap.
+SHAPE_BLOCK_SHIFT = 32 | 64
+SHAPE_BLOCK_SHIFT_W = 5
+# The default above SHAPE_BLOCK, which is what a file gets unless --shape-block says otherwise.
+# Chosen on beep.wav at two rates, and it won both: 145 b/f against 221 at 24 kbit/s per
+# channel, ES 10.016 against 9.565, and 119 b/f against 206 at 10 kbit/s, ES 6.553 against
+# 5.774 - where it is also 2% cheaper, because the fine words would otherwise be buying
+# nothing. The trade it gives up is painting error, which ES cannot see: 1.15 dB median / 3.2 dB
+# at the 90th percentile on two bands, against 1.40 / 4.26 here. It is a real trade, and the
+# rate is not what decides it - the field is roughly a fifth of the file either way.
+SHAPE_BLOCK_WIDE = 4
+# Two bands, about 375 Hz. Eight bands was one power mean across 1.5 kHz, and that mean
+# sits on the loud end of a falling block, so the top of the block plays hot. On the loud
+# 8 s of beep.wav, at the same plane count, a painted band within 36 dB of the frame peak
+# was off by 2.0 dB median and 5.2 dB at the 90th percentile. Two bands brings that to
+# 1.3 and 3.3. One band is always flat, so the gate below would paint an isolated partial.
+# A pair still codes 0 when one side is silence. The finer words cost about 130 bits/frame
+# and the 12 kbit/s solve on that slice drops from 17 planes to 11 to stay on the rate.
+# Moving this changes every SHAPE_FLAG file.
+SHAPE_BLOCK = 2
+# Geometric mean over arithmetic mean of the band powers in a block. A single partial sits
+# near 0, because the empty neighbours crush the geometric mean, and the power mean would
+# play those neighbours at the partial's level. Noise that actually fills the block sits
+# near 1 (measured ≥ 0.5 on air, ≤ 0.17 on an isolated partial). Below LO the word is 0;
+# above HI the level is the power mean; between them it fades, so a block on the line does
+# not tick on and off every hop.
+SHAPE_FLAT_LO = 0.20
+SHAPE_FLAT_HI = 0.45
+# dB of the block's power mean under the frame's loudest band. Full level within FULL,
+# silence by OFF. Bright air on a loud fundamental sits about 35–45 dB down and a pure
+# bass's leakage sits past 80, which is the split these two numbers are.
+SHAPE_DEPTH_FULL = 42.0
+SHAPE_DEPTH_OFF = 66.0
 
 # Noise fill of dead bands. A band with b = 0 decodes to silence, and at 10 kbit/s that is
 # most of everything above ~7 kHz, which is the hole this pays for. The decoder already knows
@@ -106,21 +163,44 @@ def _bits_of(vals, widths):
 
 
 class Writer:
-    """MSB-first, same convention as rsc_encoder.py's Rice writer and the same bit order a
-    field-by-field loop emits - which is verified against _ref_stream.py rather than assumed.
+    """MSB-first, same bit order a field-by-field loop emits.
 
-    Bits accumulate as a vector and are packed once at the end. Packing per value was the
-    encoder's hot path for no reason: the bytes do not care what order they were told in.
+    Bits collect in a small integer and spill to bytes every few kilobits. One numpy
+    array per field was most of the cost of writing a frame: a loud pyramid frame
+    puts three tiny fields per live band, and packing each one on its own dominated
+    the encode. The bytes are the ones packbits used to produce.
     """
 
+    _SPILL = 1 << 15
+
     def __init__(self):
-        self._chunks = []
+        self._parts = []
+        self._acc = 0
         self._n = 0
+        self._total = 0
+
+    def _put_raw(self, value, w):
+        w = int(w)
+        if w <= 0:
+            return
+        self._acc = (self._acc << w) | (int(value) & ((1 << w) - 1))
+        self._n += w
+        self._total += w
+        if self._n >= self._SPILL:
+            self._spill()
+
+    def _spill(self):
+        spare = self._n & 7
+        take = self._n - spare
+        if take <= 0:
+            return
+        acc = self._acc >> spare if spare else self._acc
+        self._parts.append(acc.to_bytes(take // 8, "big"))
+        self._acc = self._acc & ((1 << spare) - 1) if spare else 0
+        self._n = spare
 
     def put(self, value, w):
-        if w:
-            self._chunks.append(_bits_of([int(value)], [w]))
-            self._n += w
+        self._put_raw(value, w)
 
     def put_fields(self, vals, widths):
         """Append many fields at once. `vals` and `widths` are parallel arrays."""
@@ -131,47 +211,110 @@ class Writer:
         bad = v < 0
         if np.any(bad):
             raise ValueError(f"field {int(v[bad][0])} is negative; sign belongs elsewhere")
-        over = v >= (np.int64(1) << np.where(wd < 63, wd, 63))
+        # Shifting 1 left by 63 wraps int64 to INT64_MIN, so the old where() made every value
+        # look oversized the moment one field happened to be 63 or 64 bits wide. A 64-bit field
+        # is only ever reachable as a Rice quotient (a single outlier among zeros) and a
+        # non-negative int64 always fits it, so widen the bound instead of the shift.
+        lim = np.where(wd < 63, np.int64(1) << np.clip(wd, 0, 62), np.iinfo(np.int64).max)
+        over = v >= lim
         if np.any(over):
             j = int(np.argmax(over))
             raise ValueError(f"value {int(v[j])} does not fit {int(wd[j])} bits")
-        self._chunks.append(_bits_of(v, wd))
-        self._n += int(wd.sum())
+        for val, width in zip(v.tolist(), wd.tolist()):
+            self._put_raw(val, width)
 
     def put_bits(self, bits):
-        self._chunks.append(np.asarray(bits, np.uint8))
-        self._n += len(bits)
+        bits = np.ascontiguousarray(np.asarray(bits, np.uint8).reshape(-1) & np.uint8(1))
+        n = int(bits.size)
+        if n == 0:
+            return
+        full = n & ~7
+        if full:
+            raw = np.packbits(bits[:full]).tobytes()
+            self._put_raw(int.from_bytes(raw, "big"), full)
+        rem = n - full
+        if rem:
+            v = 0
+            for bit in bits[full:].tolist():
+                v = (v << 1) | int(bit)
+            self._put_raw(v, rem)
 
     def bits(self):
-        return self._n
+        return self._total
 
     def done(self):
-        pad = (-self._n) % 8
+        pad = (-self._total) % 8
         if pad:
-            self._chunks.append(np.zeros(pad, np.uint8))
-            self._n += pad
-        if not self._chunks:
+            self._put_raw(0, pad)
+        self._spill()
+        if not self._parts:
             return b""
-        return np.packbits(np.concatenate(self._chunks)).tobytes()
+        return b"".join(self._parts)
 
 
 class Reader:
+    """MSB-first. The reservoir is a Python int holding the bits not yet consumed, refilled
+    four bytes at a time. A per-byte refill was one Python call per coefficient, and a flat
+    band is sixteen of those. `take` pulls a whole field in one shift; `quotient` counts the
+    zeros of a Rice code from the highest set bit instead of reading them one by one.
+    Past the end of the buffer the refill is zeros, which is what a short read has to do:
+    a truncated stream runs on rather than raising, and callers must not hand this arbitrary
+    bytes."""
+
     def __init__(self, data):
         self.d = data
+        self.L = len(data)
         self.i = 0
         self.acc = 0
         self.n = 0
 
+    def _fill(self, w):
+        acc, n, i = self.acc, self.n, self.i
+        d, L = self.d, self.L
+        while n < w:
+            if i + 4 <= L:
+                acc = (acc << 32) | int.from_bytes(d[i:i + 4], "big")
+                i += 4
+                n += 32
+            else:
+                b = d[i] if i < L else 0
+                i += 1
+                acc = (acc << 8) | b
+                n += 8
+        self.acc, self.n, self.i = acc, n, i
+
     def get(self, w):
-        while self.n < w:
-            b = self.d[self.i] if self.i < len(self.d) else 0
-            self.i += 1
-            self.acc = (self.acc << 8) | b
-            self.n += 8
-        self.n -= w
-        v = (self.acc >> self.n) & ((1 << w) - 1) if w else 0
-        self.acc &= (1 << self.n) - 1
+        if not w:
+            return 0
+        self._fill(w)
+        n = self.n - w
+        v = (self.acc >> n) & ((1 << w) - 1)
+        self.n = n
+        self.acc = self.acc & ((1 << n) - 1) if n else 0
         return v
+
+    def take(self, w):
+        """The next `w` bits as one integer, MSB first. Same bits `get` would return, one call."""
+        return self.get(w)
+
+    def quotient(self):
+        """How many 0-bits precede the next 1, consuming that 1. The Rice quotient."""
+        q = 0
+        while True:
+            if self.n == 0:
+                self._fill(1)
+            acc, n = self.acc, self.n
+            if acc == 0:
+                q += n
+                self.n = 0
+                self.acc = 0
+                continue
+            lead = (n - 1) - (acc.bit_length() - 1)
+            q += lead
+            n = n - lead - 1
+            self.n = n
+            self.acc = acc & ((1 << n) - 1) if n else 0
+            return q
 
 
 # ------------------------------------------------------------------- codes
@@ -254,12 +397,13 @@ def scatter(buf, vals, widths, at):
 def read_rice(r, n, k):
     """Rice(k) with no bound on the quotient: a corrupted stream reads on to the end of the
     buffer rather than failing early, so callers must not feed this arbitrary bytes."""
-    out = []
-    for _ in range(n):
-        q = 0
-        while r.get(1) == 0:
-            q += 1
-        out.append((q << k) | (r.get(k) if k else 0))
+    out = np.empty(n, np.int64)
+    if k:
+        for i in range(n):
+            out[i] = (r.quotient() << k) | r.get(k)
+    else:
+        for i in range(n):
+            out[i] = r.quotient()
     return out
 
 
@@ -277,7 +421,9 @@ def band_exponents(A_band):
     can be handed. The cost is that it is up to 2x coarser than the band's exact peak,
     measured at -0.19 dB (cam) / -0.25 dB (ij), and it is the price of a decodable codec.
     """
-    peak = np.abs(A_band).max(axis=1).astype(np.float64)
+    # The last axis is the bins of a band. A stack of frames is the same call: the peak
+    # does not depend on any other frame, so the encoder can hand the whole file at once.
+    peak = np.abs(A_band).max(axis=-1).astype(np.float64)
     E = np.where(peak > 0.0, np.ceil(np.log2(np.maximum(peak, 2.0 ** -320))), 0.0)
     return E.astype(np.int64)
 
@@ -297,37 +443,50 @@ def quantise_bands(A_band, E_band, b_band):
     better than spending an extra bit per bin on every band.
     """
     step = band_steps(E_band, b_band)
-    m = np.round(A_band / step[:, None])
+    m = np.round(A_band / step[..., None])
     lim = np.where(b_band > 0, (1 << np.maximum(b_band, 1)) - 1, 0)
-    m = np.clip(m, -lim[:, None].astype(np.float64), lim[:, None].astype(np.float64))
-    return np.where(b_band[:, None] > 0, m, 0.0).astype(np.int64)
+    m = np.clip(m, -lim[..., None].astype(np.float64), lim[..., None].astype(np.float64))
+    return np.where(b_band[..., None] > 0, m, 0.0).astype(np.int64)
 
 
-def reconstruct_bands(E_band, b_band, mant, levels=None, frame=0, width=16, shape=None):
+def reconstruct_bands(E_band, b_band, mant, levels=None, frame=0, width=16, shape=None,
+                      pulses=None):
     """
     The one reconstruction formula. Encoder and decoder both call this, so agreement is not a
     thing that can drift. levels=None means no fill, which is the whole point of putting it in
     the signature: the encoder's ES and the decoder's samples come from the same call with the
     same arguments, so a fill that only the encoder hears is impossible to ship by accident.
     shape is the per-band words of the shape field, applied after the fill where they are lit.
+    pulses is the pyramid replacement for live bands, band-major. Those bands are written
+    with zero mantissas, so a nonzero pulse bin is the whole sample. A zero row is not a
+    pyramid band: dead-band noise is left where it was drawn.
     """
     X = band_steps(E_band, b_band)[:, None] * mant.astype(np.float64)
-    if levels is not None:
-        X = fill_bands(X, dead_runs(b_band), levels, frame, width)
-    if shape is not None:
-        X = shape_bands(X, shape, frame, width)
+    if levels is not None or shape is not None:
+        # One draw per band. A lit shape word replaces the run's level, and the noise is a
+        # function of (frame, band) only, so drawing the winning level once is the same sample
+        # the previous order produced by drawing the run and then overwriting it.
+        lvl = np.full(X.shape[0], np.nan)
+        if levels is not None:
+            _write_run_levels(lvl, dead_runs(b_band), levels)
+        if shape is not None:
+            _write_shape_levels(lvl, shape)
+        X = _draw_floor(X, lvl, frame, width)
+    if pulses is not None:
+        p = np.asarray(pulses, np.float64).reshape(X.shape)
+        hit = p != 0.0
+        X[hit] = p[hit]
     return X
 
 
 def shape_bands(X_band, words, frame, width):
     """Where a shape word is lit it replaces what the run word laid there - one band, its own
     word, the same deterministic noise draw - and where it is zero the fill stands untouched.
-    Both outcomes are band-safe: the word came from the band's own ceiling, and the run word
-    is floored under the run's tightest bin."""
-    for j in np.flatnonzero(np.asarray(words, np.int64) > 0):
-        X_band[int(j)] = (fill_noise(int(j), int(frame), width)
-                          * 10.0 ** (0.05 * fill_level(int(words[int(j)]))))
-    return X_band
+    A lit word is that block's energy on the fill grid, not a mask ceiling. Code 0 is the
+    encoder declining to paint a sparse or quiet block, and this side does not second-guess it."""
+    lvl = np.full(X_band.shape[0], np.nan)
+    _write_shape_levels(lvl, words)
+    return _draw_floor(X_band, lvl, frame, width)
 
 
 # ------------------------------------------------------------- noise fill
@@ -351,23 +510,35 @@ _HASH = (1 << 32) - 1
 
 
 def hash_noise(n, frame, band):
-    """mulberry32, vectorised. Two integers in, n deterministic values out: three multiplies,
-    three shifts, no state, and short enough to port to Luau without trusting a float model.
-    Uniform in [-1, 1), which is a fine input shape because it gets normalised anyway."""
-    s = (int(frame) * 0x9E3779B9 + int(band) * 0x85EBCA6B) & _HASH
+    """mulberry32. Two integers in, n deterministic values out: three multiplies, three
+    shifts, no state, and short enough to port to Luau without trusting a float model.
+    Uniform in [-1, 1), which is a fine input shape because it gets normalised anyway.
+
+    `band` may be an array. One band returns shape (n,), a stack of bands returns (bands, n).
+    The integer steps are the scalar formula, so a stack agrees with calling it once per band.
+    """
+    bands = np.asarray(band, np.int64)
+    scalar = bands.ndim == 0
+    bands = np.atleast_1d(bands)
+    s = (np.int64(frame) * np.int64(0x9E3779B9) + bands * np.int64(0x85EBCA6B)) & np.int64(_HASH)
     u = np.arange(n, dtype=np.int64)
-    x = (s + u * 0x9E3779B1) & _HASH
-    x = ((x ^ (x >> 16)) * 0x85EBCA6B) & _HASH
-    x = ((x ^ (x >> 13)) * 0xC2B2AE35) & _HASH
-    x = x ^ (x >> 16)
-    return (x.astype(np.float64) / 2 ** 31 - 1.0)
+    x = (s[:, None] + u[None, :] * np.int64(0x9E3779B1)) & np.int64(_HASH)
+    x = ((x ^ (x >> np.int64(16))) * np.int64(0x85EBCA6B)) & np.int64(_HASH)
+    x = ((x ^ (x >> np.int64(13))) * np.int64(0xC2B2AE35)) & np.int64(_HASH)
+    x = x ^ (x >> np.int64(16))
+    out = x.astype(np.float64) / 2 ** 31 - 1.0
+    return out[0] if scalar else out
 
 
 def fill_noise(band, frame, width):
-    """Unit-RMS noise for one band. The normalisation is recomputed from the values themselves,
-    on both sides, so nothing about it has to be transmitted and no rounding rule can disagree."""
+    """Unit-RMS noise for one band, or for a stack of bands. The normalisation is recomputed
+    from the values themselves, on both sides, so nothing about it has to be transmitted and
+    no rounding rule can disagree."""
     v = hash_noise(width, frame, band)
-    return v / float(np.sqrt((v * v).mean()))
+    if v.ndim == 1:
+        return v / float(np.sqrt((v * v).mean()))
+    rms = np.sqrt((v * v).mean(axis=-1))
+    return v / rms[:, None]
 
 
 def fill_code(level_db):
@@ -384,22 +555,25 @@ def fill_level(code):
     return FILL_FLOOR + code * step if code else -1e9
 
 
+def _dead_bounds(b_band):
+    """Inclusive-start, exclusive-end index of each contiguous run of dead bands."""
+    dead = np.asarray(b_band) <= 0
+    if dead.size == 0 or not dead.any():
+        z = np.zeros(0, np.int64)
+        return z, z
+    d = np.empty(dead.size + 2, np.int8)
+    d[0] = 0
+    d[-1] = 0
+    d[1:-1] = dead
+    ch = np.diff(d)
+    return np.flatnonzero(ch == 1), np.flatnonzero(ch == -1)
+
+
 def dead_runs(b_band):
     """Contiguous runs of dead bands, band-major, as index arrays. The decoder can derive this
     from b alone, which is the entire reason the run is the unit of transmission."""
-    dead = np.asarray(b_band) <= 0
-    out = []
-    j = 0
-    while j < len(dead):
-        if dead[j]:
-            k = j
-            while k + 1 < len(dead) and dead[k + 1]:
-                k += 1
-            out.append(np.arange(j, k + 1))
-            j = k + 1
-        else:
-            j += 1
-    return out
+    starts, ends = _dead_bounds(b_band)
+    return [np.arange(int(s), int(e)) for s, e in zip(starts, ends)]
 
 
 def run_tilt(code, tilt, j, lo, hi):
@@ -415,6 +589,43 @@ def run_tilt(code, tilt, j, lo, hi):
     return fill_level(code) + FILL_TILT[int(tilt)] * (j - mid) / half
 
 
+def _write_run_levels(lvl, runs, levels):
+    """Per-band floor of each live run, in dB, written into `lvl` (NaN elsewhere)."""
+    for r, (code, tilt) in zip(runs, levels):
+        if not int(code):
+            continue
+        j = np.asarray(r, np.int64)
+        lo = float(int(j[0]))
+        hi = float(int(j[-1]))
+        mid = (lo + hi) * 0.5
+        half = max((hi - lo) * 0.5, 1.0)
+        pos = j.astype(np.float64)
+        lvl[j] = fill_level(int(code)) + FILL_TILT[int(tilt)] * (pos - mid) / half
+
+
+def _write_shape_levels(lvl, words):
+    """A lit shape word replaces whatever the run wrote. Code 0 leaves the run alone."""
+    words = np.asarray(words, np.int64)
+    lit = np.flatnonzero(words > 0)
+    if lit.size == 0:
+        return
+    step = -FILL_FLOOR / ((1 << FILL_BITS) - 1)
+    lvl[lit] = FILL_FLOOR + words[lit].astype(np.float64) * step
+
+
+def _draw_floor(X_band, lvl, frame, width):
+    """Unit-RMS noise times the linear gain of `lvl`, for every band that has one.
+    Bands share one hash call. The draw for a single band is fill_noise's own formula."""
+    idx = np.flatnonzero(~np.isnan(lvl))
+    if idx.size == 0:
+        return X_band
+    v = hash_noise(width, int(frame), idx)
+    rms = np.sqrt((v * v).mean(axis=-1))
+    gain = 10.0 ** (0.05 * lvl[idx])
+    X_band[idx] = (v / rms[:, None]) * gain[:, None]
+    return X_band
+
+
 def fill_bands(X_band, runs, levels, frame, width):
     """
     Replace silence with noise, band by band. Everything the decoder needs is here: b says
@@ -426,15 +637,9 @@ def fill_bands(X_band, runs, levels, frame, width):
     10 kHz, which is a filter, not a noise floor. Independent draws per band are what makes the
     thing read as air rather than as ringing.
     """
-    for r, (code, tilt) in zip(runs, levels):
-        if not code:
-            continue
-        lo, hi = float(int(r[0])), float(int(r[-1]))
-        for j in r:
-            lvl = run_tilt(code, tilt, float(j), lo, hi)
-            X_band[int(j)] = (fill_noise(int(j), int(frame), width)
-                              * 10.0 ** (0.05 * lvl))
-    return X_band
+    lvl = np.full(X_band.shape[0], np.nan)
+    _write_run_levels(lvl, runs, levels)
+    return _draw_floor(X_band, lvl, frame, width)
 
 
 def write_fill(w, b_band, levels):
@@ -448,9 +653,13 @@ def write_fill(w, b_band, levels):
         w.put(0, 1)
         return
     w.put(1, 1)
-    for c, t in levels:
-        w.put(int(c), FILL_BITS)
-        w.put(int(t), FILL_TILT_BITS)
+    # One field array, not a put() per word. The bit order is the same MSB-first sequence
+    # a loop of puts would have emitted: level, then slope, per run.
+    lv = np.asarray(levels, np.int64).reshape(-1)
+    wd = np.empty(lv.shape, np.int64)
+    wd[0::2] = FILL_BITS
+    wd[1::2] = FILL_TILT_BITS
+    w.put_fields(lv, wd)
 
 
 def read_fill(r, b_band):
@@ -493,25 +702,39 @@ def run_fill_words(cap_db, b_band, mode="safe"):
     cap_db is per band. How that ceiling is worked out is a masking question and lives with the
     mask, not here.
     """
+    starts, ends = _dead_bounds(b_band)
+    if starts.size == 0:
+        return []
+    cap = np.asarray(cap_db, np.float64)
+    if mode == "mean":
+        # np.mean on the run, not a reduced sum: a long run's mean is what fill_code rounds,
+        # and a different summation order can move that rounding.
+        return [(fill_code(float(np.mean(cap[int(s):int(e)]))), 0)
+                for s, e in zip(starts, ends)]
+    lengths = ends - starts
+    idx = np.flatnonzero(np.asarray(b_band) <= 0)
+    group = np.cumsum(lengths) - lengths
+    lo = starts.astype(np.float64)
+    hi = (ends - 1).astype(np.float64)
+    rid = np.repeat(np.arange(starts.size), lengths)
+    mid = (lo[rid] + hi[rid]) * 0.5
+    half = np.maximum((hi[rid] - lo[rid]) * 0.5, 1.0)
+    p = (idx.astype(np.float64) - mid) / half
+    cap_d = cap[idx]
+    best_lv = np.full(starts.size, FILL_FLOOR)
+    best_q = np.zeros(starts.size, np.int64)
+    for q, slope in enumerate(FILL_TILT):
+        mn = np.minimum.reduceat(cap_d - slope * p, group)
+        better = mn > best_lv
+        best_lv = np.where(better, mn, best_lv)
+        best_q = np.where(better, q, best_q)
     out = []
-    cap = np.asarray(cap_db)
-    for r in dead_runs(b_band):
-        if mode == "mean":
-            out.append((fill_code(float(np.mean(cap[r]))), 0))
-            continue
-        j = np.arange(int(r[0]), int(r[-1]) + 1, dtype=np.float64)
-        mid = (j[0] + j[-1]) * 0.5
-        half = max((j[-1] - j[0]) * 0.5, 1.0)
-        p = (j - mid) / half
-        best_lv, best_q = FILL_FLOOR, 0
-        for q, s in enumerate(FILL_TILT):
-            lv = float(np.min(cap[r] - s * p))
-            if lv > best_lv:
-                best_lv, best_q = lv, q
-        code = fill_code(best_lv)
-        while code and fill_level(code) > best_lv + 1e-9:
+    for lv, q in zip(best_lv, best_q):
+        lv = float(lv)
+        code = fill_code(lv)
+        while code and fill_level(code) > lv + 1e-9:
             code -= 1
-        out.append((code, best_q))
+        out.append((code, int(q)))
     return out
 
 
@@ -526,6 +749,7 @@ def band_fill_cap(A_band, thr_band=None):
     Without thr_band this degrades to "fill at the band's energy", which is what the earlier
     experiment did, and is what this file exists to prove is not safe.
     """
+    # Last axis is the bins. A stack of frames is the same reduction, one cap per band.
     lvl = 10.0 * np.log10(np.maximum((np.asarray(A_band) ** 2).mean(axis=-1), 10 ** FILL_FLOOR))
     if thr_band is None:
         return lvl
@@ -542,41 +766,211 @@ def shape_reg(sr, n2, width):
     return hz.reshape(nc // width, width).mean(axis=1) >= SHAPE_F0
 
 
+def shape_block(flags):
+    """Bands per shape word, read off the header like the region is. Not sending a file's
+    geometry is how a decoder gets to disagree with the encoder about it, and this one is
+    worth two header bits rather than a per-frame field."""
+    return SHAPE_BLOCK << ((int(flags) & SHAPE_BLOCK_SHIFT) >> SHAPE_BLOCK_SHIFT_W)
+
+
+def shape_block_shift(block):
+    """The header bits that say `block`, which is shape_block's inverse and the encoder's
+    only way to be honest about what it wrote. An unrepresentable width is refused here
+    rather than encoded as something a decoder will misread into a different stream."""
+    k, b = 0, SHAPE_BLOCK
+    while b < int(block):
+        b, k = b << 1, k + 1
+    if b != int(block):
+        raise ValueError(f"shape block {int(block)} is not a power-of-two multiple of "
+                         f"{SHAPE_BLOCK}")
+    return k
+
+
 def shape_codes(cap_db, b):
-    """Each dead band's own ceiling floored DOWN onto the fill word grid: what could be sent if
-    every band were described individually. Floor, not round, because a word that rounds up is
-    the decoder playing noise the encoder never certified."""
+    """Each dead band's own level rounded onto the fill word grid. Live bands are 0: the
+    shape field never describes a band the mantissas already carry."""
     step = -FILL_FLOOR / ((1 << FILL_BITS) - 1)
-    c = np.floor((np.maximum(np.asarray(cap_db, np.float64), FILL_FLOOR)
-                  - FILL_FLOOR) / step + 1e-9)
+    c = np.round((np.maximum(np.asarray(cap_db, np.float64), FILL_FLOOR)
+                  - FILL_FLOOR) / step)
     c = np.clip(c, 0, (1 << FILL_BITS) - 1).astype(np.int64)
     c[np.asarray(b) > 0] = 0
     return c
 
 
-def block_shape(codes, block):
-    """Per-block level = MIN of the block's codes, so a block decodes at the level that is
-    legal for its tightest band, not one word per band."""
-    codes = np.asarray(codes, np.int64)
-    m = codes.size
+def _air_keep(level, peak_db):
+    """Power gain for one block, and its power-mean level in dB.
+
+    Zero means the word is silence. A partial plus empty neighbours has a flatness near 0,
+    and painting the power mean there is a hiss across the whole block. A block far under
+    the frame peak is treble the signal barely has, and the same hiss reads as an artifact
+    there even when the bands are flat. Both fades are in power, and they multiply.
+    """
+    lvl = np.asarray(level, np.float64)
+    pw = 10.0 ** (lvl / 10.0)
+    am = float(pw.mean())
+    floor_p = 10.0 ** (FILL_FLOOR / 10.0)
+    if not np.isfinite(am) or am <= floor_p:
+        return 0.0, FILL_FLOOR
+    gm = float(np.exp(np.mean(np.log(np.maximum(pw, floor_p)))))
+    flat = gm / am
+    db = 10.0 * np.log10(am)
+    if flat <= SHAPE_FLAT_LO:
+        fg = 0.0
+    elif flat >= SHAPE_FLAT_HI:
+        fg = 1.0
+    else:
+        fg = (flat - SHAPE_FLAT_LO) / (SHAPE_FLAT_HI - SHAPE_FLAT_LO)
+    below = float(peak_db) - db
+    if below >= SHAPE_DEPTH_OFF:
+        dg = 0.0
+    elif below <= SHAPE_DEPTH_FULL:
+        dg = 1.0
+    else:
+        dg = (SHAPE_DEPTH_OFF - below) / (SHAPE_DEPTH_OFF - SHAPE_DEPTH_FULL)
+    return fg * dg, db
+
+
+def _fill_codes(level_db):
+    """`fill_code` on an array. Same round, same clip."""
+    step = -FILL_FLOOR / ((1 << FILL_BITS) - 1)
+    x = (np.maximum(np.asarray(level_db, np.float64), FILL_FLOOR) - FILL_FLOOR) / step
+    return np.clip(np.round(x), 0, (1 << FILL_BITS) - 1).astype(np.int64)
+
+
+def _block_codes(chunks, peak_db):
+    """One code per row of `chunks`. The same gate as `_air_keep`, on every block at once.
+
+    A frame of treble is about sixty of these, and calling the scalar gate on each one
+    was a numpy launch per pair. The means are over the row, which for these widths is
+    the same sum the scalar path reduces.
+    """
+    pw = 10.0 ** (np.asarray(chunks, np.float64) / 10.0)
+    am = pw.mean(axis=1)
+    floor_p = 10.0 ** (FILL_FLOOR / 10.0)
+    dead = ~np.isfinite(am) | (am <= floor_p)
+    logged = np.log(np.maximum(pw, floor_p))
+    gm = np.exp(logged.mean(axis=1))
+    flat = np.where(dead, 0.0, gm / am)
+    db = np.where(dead, FILL_FLOOR, 10.0 * np.log10(np.maximum(am, floor_p)))
+    span_f = SHAPE_FLAT_HI - SHAPE_FLAT_LO
+    span_d = SHAPE_DEPTH_OFF - SHAPE_DEPTH_FULL
+    fg = np.clip((flat - SHAPE_FLAT_LO) / span_f, 0.0, 1.0)
+    # A scalar peak is the one frame block_shape has. A vector is one peak per
+    # row, so a whole window of blocks can share this call. The subtraction is
+    # the same one the scalar gate does.
+    peak = np.asarray(peak_db, np.float64)
+    below = (float(peak) if peak.ndim == 0 else peak) - db
+    dg = np.clip((SHAPE_DEPTH_OFF - below) / span_d, 0.0, 1.0)
+    gain = np.where(dead, 0.0, fg * dg)
+    fade = (gain > 0.0) & (gain < 1.0)
+    if fade.any():
+        db = db.copy()
+        db[fade] = db[fade] + 10.0 * np.log10(gain[fade])
+    out = np.zeros(chunks.shape[0], np.int64)
+    use = gain > 0.0
+    if use.any():
+        out[use] = _fill_codes(db[use])
+    return out
+
+
+def block_shape(level_db, block, peak_db):
+    """One code per block of dead treble, or 0 when that block is not air.
+
+    The level is the power mean of the band energies, not the mean of their decibels, and
+    only once the block has passed the flatness and depth knees in `_air_keep`. Averaging
+    decibels would sit a bright partial under a run of quiet neighbours. Averaging power
+    across a partial and its empty neighbours is the opposite mistake, and it is the one
+    this gate refuses: those neighbours would play at the partial's level. The code is what
+    the decoder plays, so the rounding is the level, not a ceiling to stay under.
+    """
+    level = np.asarray(level_db, np.float64)
+    m = int(level.size)
     if m == 0:
-        return codes
-    return np.array([int(codes[i * block:min(i * block + block, m)].min())
-                     for i in range((m + block - 1) // block)], np.int64)
+        return np.zeros(0, np.int64)
+    block = int(block)
+    nblk = (m + block - 1) // block
+    out = np.zeros(nblk, np.int64)
+    nfull = m // block
+    if nfull:
+        out[:nfull] = _block_codes(level[:nfull * block].reshape(nfull, block), peak_db)
+    if nfull < nblk:
+        gain, db = _air_keep(level[nfull * block:], peak_db)
+        if gain > 0.0:
+            if gain < 1.0:
+                db = db + 10.0 * np.log10(gain)
+            out[nfull] = fill_code(db)
+    return out
 
 
-def shape_field(cap_db, b, reg, block=SHAPE_BLOCK):
+def shape_window(level_db, bits, reg, block=SHAPE_BLOCK):
+    """Shape field of every frame. The codes match `shape_field` one frame at a time.
+
+    The gate does not care which run a block came from, only the block's bands
+    and that frame's peak. Stacking the blocks is one launch instead of one
+    per pair, which is what the rate solve was repeating for every plane count
+    it tried.
+    """
+    level = np.asarray(level_db, np.float64)
+    bits = np.asarray(bits)
+    if level.ndim == 1:
+        level = level.reshape(1, -1)
+        bits = np.asarray(bits).reshape(1, -1)
+    nfr = int(level.shape[0])
+    block = int(block)
+    reg = np.asarray(reg, bool)
+    fields = []
+    groups = {}
+    peaks_g = {}
+    where = {}
+    for f in range(nfr):
+        row_l = level[f]
+        peak = float(row_l.max()) if row_l.size else FILL_FLOOR
+        row = []
+        runs = dead_runs(bits[f])
+        for ri, r in enumerate(runs):
+            sel = r[reg[r]]
+            if sel.size == 0:
+                row.append(None)
+                continue
+            nblk = (int(sel.size) + block - 1) // block
+            dest = np.zeros(nblk, np.int64)
+            row.append(dest)
+            nfull = int(sel.size) // block
+            if nfull:
+                groups.setdefault(block, []).append(
+                    row_l[sel[:nfull * block]].reshape(nfull, block))
+                peaks_g.setdefault(block, []).append(np.full(nfull, peak, np.float64))
+                where.setdefault(block, []).append((dest, 0, nfull))
+            tail = int(sel.size) - nfull * block
+            if tail:
+                groups.setdefault(tail, []).append(row_l[sel[nfull * block:]].reshape(1, tail))
+                peaks_g.setdefault(tail, []).append(np.full(1, peak, np.float64))
+                where.setdefault(tail, []).append((dest, nfull, 1))
+        fields.append(row)
+    for width, parts in groups.items():
+        codes = _block_codes(np.concatenate(parts, axis=0), np.concatenate(peaks_g[width]))
+        at = 0
+        for dest, start, n in where[width]:
+            dest[start:start + n] = codes[at:at + n]
+            at += n
+    return fields
+
+
+def shape_field(level_db, b, reg, block=SHAPE_BLOCK):
     """The shape grammar of one frame, as one block-code stream per dead run, parallel to
-    dead_runs(b). None where the region does not touch the run, which is derivable from b and
-    costs nothing, and a run whose blocks are all silent sends a single flag bit."""
-    codes = shape_codes(cap_db, b)
+    dead_runs(b). `level_db` is each band's own energy, and the frame peak taken from it is
+    what "not a lot of treble" is measured against. None where the region does not touch
+    the run, which is derivable from b and costs nothing, and a run whose blocks round to
+    silence sends a single flag bit."""
+    level = np.asarray(level_db, np.float64)
+    peak = float(level.max()) if level.size else FILL_FLOOR
     field = []
     for r in dead_runs(b):
         sel = r[reg[r]]
         if sel.size == 0:
             field.append(None)
             continue
-        field.append(block_shape(codes[sel], block))
+        field.append(block_shape(level[sel], block, peak))
     return field
 
 
@@ -655,6 +1049,491 @@ def shape_cost(field):
     return tot
 
 
+# ------------------------------------------------------------- pyramid pulses
+# A live band is one gain and one shape. The gain is the band's energy. The shape is a
+# signed integer vector on the L1 pyramid, length = every bin in the band, and the
+# reconstruction is gain * y / ||y||. K is however many pulses the band's own bits can
+# hold. Dead bands are not touched, so noise fill on a band the allocator left closed
+# stays noise. The index is the combinatorial number of the vector, written in 16-bit
+# chunks so a Luau port never holds the whole integer in one bit32 op. K stops at 64
+# because that is already more pulses than a 16-bin band can usefully spend.
+PVQ_K_MAX = 64
+_PVQ_N = 16
+_PVQ_COUNT = {}
+
+
+def _pvq_tables(n_max, k_max):
+    """V(n, k) for the band width this codec actually uses. The recurrence is the one
+    pvq_count walks. A list beats a dict lookup on every pulse of every band."""
+    tab = [[0] * (k_max + 1) for _ in range(n_max + 1)]
+    for n in range(1, n_max + 1):
+        tab[n][0] = 1
+    for k in range(1, k_max + 1):
+        tab[1][k] = 2
+    for n in range(2, n_max + 1):
+        row, prev = tab[n], tab[n - 1]
+        acc = row[0]
+        for k in range(1, k_max + 1):
+            acc = acc + prev[k] + prev[k - 1]
+            row[k] = acc
+    bits = [[(v - 1).bit_length() if v > 1 else 0 for v in row] for row in tab]
+    return tab, bits
+
+
+_PVQ_TAB, _PVQ_BITS = _pvq_tables(_PVQ_N, PVQ_K_MAX)
+
+
+def pvq_claims(b):
+    """Every live band. Those are the ones whose scalar mantissas are not in the file.
+    A dead band has no scalar field to replace."""
+    return np.asarray(b) > 0
+
+
+def pvq_count(n, k):
+    """How many signed integer vectors of length n have L1 norm k. The zero vector is the
+    one vector of norm 0. Length 1 is just +k and -k."""
+    n, k = int(n), int(k)
+    if k < 0 or n <= 0:
+        return 0
+    if n <= _PVQ_N and k <= PVQ_K_MAX:
+        return _PVQ_TAB[n][k]
+    hit = _PVQ_COUNT.get((n, k))
+    if hit is not None:
+        return hit
+    if k == 0:
+        v = 1
+    elif n == 1:
+        v = 2
+    else:
+        # Last coordinate 0, or +m, or -m. This is the split the index walks.
+        v = pvq_count(n, k - 1) + pvq_count(n - 1, k) + pvq_count(n - 1, k - 1)
+    _PVQ_COUNT[(n, k)] = v
+    return v
+
+
+def _index_bits(n, k):
+    v = pvq_count(n, k)
+    if v <= 1:
+        return 0
+    return (v - 1).bit_length()
+
+
+def _gamma_bits(k):
+    return 2 * (int(k).bit_length() - 1) + 1
+
+
+def _write_gamma(w, k):
+    """Elias gamma. K = 1 is a single 1-bit, which is the common low-rate band."""
+    k = int(k)
+    z = k.bit_length() - 1
+    if z:
+        w.put(0, z)
+    w.put(k, z + 1)
+
+
+def _read_gamma(r):
+    z = 0
+    while r.get(1) == 0:
+        z += 1
+        if z > 16:
+            break
+    if z == 0:
+        return 1
+    return (1 << z) | r.get(z)
+
+
+def _put_wide(w, value, width):
+    """MSB-first, 16 bits at a time. Writer.put stores the value in an int64."""
+    value = int(value)
+    left = int(width)
+    while left > 0:
+        n = 16 if left > 16 else left
+        left -= n
+        w.put((value >> left) & ((1 << n) - 1), n)
+
+
+def _enc_pvq(y, n, k):
+    """Combinadic index. For a 16-bin band the counts are the table, and the walk
+    stays on the same list: slicing a new array per coordinate was most of the cost.
+    The split is unchanged, last coordinate 0, then +m, then -m."""
+    n = int(n)
+    k = int(k)
+    if 0 < n <= _PVQ_N and 0 <= k <= PVQ_K_MAX:
+        seq = y if isinstance(y, list) else [int(v) for v in y[:n]]
+        return _enc_pvq_tab(seq, n, k)
+    return _enc_pvq_slow(y, n, k)
+
+
+def _enc_pvq_tab(y, n, k):
+    tab = _PVQ_TAB
+    total = 0
+    while True:
+        if k == 0 or n == 0:
+            return total
+        if n == 1:
+            return total + (0 if y[0] > 0 else 1)
+        last = y[n - 1]
+        if last == 0:
+            n -= 1
+            continue
+        base = tab[n - 1][k]
+        m = -last if last < 0 else last
+        if m > 1:
+            row = tab[n - 1]
+            acc = 0
+            for t in range(k - 1, k - m, -1):
+                acc += row[t]
+            base += acc << 1
+        if last < 0:
+            base += tab[n - 1][k - m]
+        total += base
+        n -= 1
+        k -= m
+
+
+def _enc_pvq_slow(y, n, k):
+    if k == 0 or n == 0:
+        return 0
+    if n == 1:
+        return 0 if int(y[0]) > 0 else 1
+    last = int(y[n - 1])
+    if last == 0:
+        return _enc_pvq(y[:n - 1], n - 1, k)
+    base = pvq_count(n - 1, k)
+    m = abs(last)
+    for j in range(1, m):
+        base += 2 * pvq_count(n - 1, k - j)
+    if last < 0:
+        base += pvq_count(n - 1, k - m)
+    return base + _enc_pvq(y[:n - 1], n - 1, k - m)
+
+
+def _dec_pvq(index, n, k, y):
+    if k == 0 or n == 0:
+        return
+    if n == 1:
+        y[0] = k if index == 0 else -k
+        return
+    left = pvq_count(n - 1, k)
+    if index < left:
+        _dec_pvq(index, n - 1, k, y[:n - 1])
+        return
+    index -= left
+    m = 1
+    while m <= k:
+        block = pvq_count(n - 1, k - m)
+        if index < block:
+            y[n - 1] = m
+            _dec_pvq(index, n - 1, k - m, y[:n - 1])
+            return
+        index -= block
+        if index < block:
+            y[n - 1] = -m
+            _dec_pvq(index, n - 1, k - m, y[:n - 1])
+            return
+        index -= block
+        m += 1
+
+
+def pvq_index(y):
+    """Index and codebook size of one signed pulse vector."""
+    y = np.asarray(y, np.int64).reshape(-1)
+    k = int(np.abs(y).sum())
+    n = int(y.size)
+    return _enc_pvq(y, n, k), pvq_count(n, k)
+
+
+def pvq_from_index(index, n, k):
+    y = np.zeros(int(n), np.int64)
+    _dec_pvq(int(index), int(n), int(k), y)
+    return y
+
+
+def pvq_synth_band(y, q, E, b):
+    """Band energy times the unit-energy shape.
+
+    `q * 2**(E-b)` is the band's L2. E is the exponent stored for that gain, and y
+    is the integer point on the pyramid. Dividing by ||y|| puts the gain on the
+    band. The tallest bin is then whatever share of the shape it has, and the
+    other bins keep theirs.
+    """
+    y = np.asarray(y, np.float64)
+    if int(q) == 0:
+        return np.zeros(y.shape, np.float64)
+    n2 = float(np.dot(y, y))
+    if n2 <= 0.0:
+        return np.zeros(y.shape, np.float64)
+    gain = int(q) * 2.0 ** (float(E) - float(b))
+    return y * (gain / np.sqrt(n2))
+
+
+def _pvq_place(x, k):
+    """Greedy pyramid search. Pulses may stack, so one gain can follow a slope."""
+    x = np.asarray(x, np.float64)
+    n = int(x.size)
+    y = np.zeros(n, np.int64)
+    if k <= 0 or n == 0:
+        return y, 0.0
+    ax = np.abs(x)
+    sx = np.sign(x).astype(np.int64)
+    sx[sx == 0] = 1
+    corr = 0.0
+    ny = 0.0
+    for _ in range(int(k)):
+        score = (corr + ax) ** 2 / (ny + 2.0 * np.abs(y) + 1.0)
+        i = int(np.argmax(score))
+        if ax[i] <= 0.0:
+            break
+        ny += 2.0 * abs(int(y[i])) + 1.0
+        corr += float(ax[i])
+        y[i] += int(sx[i])
+    if ny <= 0.0:
+        return y, 0.0
+    return y, corr / ny
+
+
+def pvq_k_for_depth(b, width, k_cap=0):
+    """Pulses the band's shape bits can hold.
+
+    The shape budget is one bit per bin of the band's depth. The gain is sent
+    on its own, in `b` bits, so it stays out of this. K is the largest pyramid
+    that fits, which is the resolution the band was given.
+    """
+    b = int(b)
+    width = int(width)
+    if b <= 0 or width <= 0:
+        return 0
+    shape_bits = width * b
+    k_hi = PVQ_K_MAX if not k_cap else min(PVQ_K_MAX, max(int(k_cap), 1))
+    bits_row = _PVQ_BITS[width] if 0 < width <= _PVQ_N else None
+    best = 1
+    for k in range(1, k_hi + 1):
+        ib = bits_row[k] if bits_row is not None else _index_bits(width, k)
+        if _gamma_bits(k) + ib <= shape_bits:
+            best = k
+        else:
+            break
+    return best
+
+
+def _k_vec(b, width, k_cap):
+    """`pvq_k_for_depth` for many bands. The cost grows with K, so the largest K
+    that fits is the count of sizes that fit."""
+    b = np.asarray(b, np.int64)
+    if int(width) != _PVQ_N:
+        return np.array([pvq_k_for_depth(int(v), width, k_cap) for v in b], np.int64)
+    bits = np.asarray(_PVQ_BITS[int(width)], np.int64)
+    gamma = np.array([_gamma_bits(k) for k in range(PVQ_K_MAX + 1)], np.int64)
+    cost = gamma + bits
+    shape_bits = np.int64(width) * b
+    ok = cost[None, :] <= shape_bits[:, None]
+    ok[:, 0] = False
+    if k_cap:
+        ok[:, int(k_cap) + 1:] = False
+    return np.where(b > 0, ok.sum(axis=1), 0).astype(np.int64)
+
+
+def _choose_bands(x, b, k_cap=0):
+    """Gain and shape for many bands at once.
+
+    One row is what `_choose_band` used to do alone: energy in bin order, then
+    exactly K greedy pulses. The score is `(corr + |x|)^2 / (ny + 2*|y| + 1)`,
+    and a tie keeps the earlier bin. Stacking the rows is the same arithmetic
+    per band, which is what makes a loud file's placement cheap.
+    """
+    x = np.asarray(x, np.float64)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    b = np.asarray(b, np.int64).reshape(-1)
+    nband, width = x.shape
+    y = np.zeros((nband, width), np.int64)
+    energy = np.zeros(nband, np.float64)
+    for i in range(width):
+        energy += x[:, i] * x[:, i]
+    live = (energy > 0.0) & (b > 0)
+    q = np.zeros(nband, np.int64)
+    E = np.zeros(nband, np.int64)
+    if live.any():
+        rms = np.zeros(nband, np.float64)
+        rms[live] = energy[live] ** 0.5
+        Ee = np.zeros(nband, np.float64)
+        Ee[live] = np.ceil(np.log2(rms[live]))
+        E = Ee.astype(np.int64)
+        step = np.zeros(nband, np.float64)
+        step[live] = 2.0 ** (E[live].astype(np.float64) - b[live].astype(np.float64))
+        good = live & (step > 0.0)
+        ratio = np.zeros(nband, np.float64)
+        ratio[good] = rms[good] / step[good]
+        lim = (np.int64(1) << np.maximum(b, 0)) - 1
+        qq = np.clip(np.round(ratio), 0, lim.astype(np.float64)).astype(np.int64)
+        q = np.where(good, qq, 0)
+        kk = _k_vec(b, width, k_cap)
+        ax = np.abs(x)
+        # A silent bin has no direction. np.sign(0) is 0, which would plant a
+        # later pulse with no sign, so a non-negative sample stays positive.
+        sx = np.where(x >= 0.0, np.int64(1), np.int64(-1))
+        ay = np.zeros((nband, width), np.float64)
+        corr = np.zeros(nband, np.float64)
+        ny = np.zeros(nband, np.float64)
+        left = np.where(live, kk, 0)
+        active = left > 0
+        rows = np.arange(nband)
+        while active.any():
+            den = ny[:, None] + 2.0 * ay + 1.0
+            num = corr[:, None] + ax
+            score = (num * num) / den
+            pick = np.argmax(score, axis=1)
+            best_ax = ax[rows, pick]
+            step_on = active & (best_ax > 0.0)
+            if not step_on.any():
+                break
+            sel = rows[step_on]
+            ii = pick[step_on]
+            ay_i = ay[sel, ii]
+            ny[sel] = ny[sel] + 2.0 * ay_i + 1.0
+            corr[sel] = corr[sel] + best_ax[step_on]
+            y[sel, ii] += sx[sel, ii]
+            ay[sel, ii] += 1.0
+            left[sel] -= 1
+            active = left > 0
+    y[np.abs(y).sum(axis=1) == 0, 0] = 1
+    return q, y, E
+
+
+def _synth_bands(y, q, E, b):
+    """`pvq_synth_band` on many bands. The pulse vector is small integers, so
+    its energy is an exact integer and the square root is the scalar one."""
+    yf = np.asarray(y, np.float64)
+    n2 = (yf * yf).sum(axis=1)
+    gain = np.asarray(q, np.float64) * 2.0 ** (
+        np.asarray(E, np.float64) - np.asarray(b, np.float64))
+    scale = np.where((np.asarray(q) > 0) & (n2 > 0.0), gain / np.sqrt(n2), 0.0)
+    return yf * scale[:, None]
+
+
+def _choose_band(x, b, k_cap):
+    """Gain and shape for one band. The batch placer does the work."""
+    q, y, E = _choose_bands(np.asarray(x, np.float64).reshape(1, -1), [b], k_cap)
+    return int(q[0]), y[0], int(E[0])
+
+
+def plan_pvq_frames(A3, E, b, k_cap=0, synth=True):
+    """Every frame's pyramid bands in one pass.
+
+    `A3` is (frames, bands, bins). The returned records follow `plan_pvq`:
+    None on a scalar band, and `(q, y)` on a pyramid band. Exponents on those
+    bands are the band-energy exponents. `synth` is the samples reconstruct
+    plays. A rate check that only needs the payload skips them.
+    """
+    A3 = np.asarray(A3, np.float64)
+    E = np.array(E, copy=True)
+    b = np.asarray(b)
+    frames, nbands, width = A3.shape
+    ff, jj = np.nonzero(b > 0)
+    recs = [[None] * nbands for _ in range(frames)]
+    if ff.size == 0:
+        pulses = np.zeros(A3.shape, np.float64) if synth else None
+        return recs, pulses, E
+    q, y, Ee = _choose_bands(A3[ff, jj], b[ff, jj], k_cap)
+    E[ff, jj] = Ee
+    pulses = None
+    if synth:
+        pulses = np.zeros(A3.shape, np.float64)
+        pulses[ff, jj] = _synth_bands(y, q, Ee, b[ff, jj])
+    for n in range(int(ff.size)):
+        recs[int(ff[n])][int(jj[n])] = (int(q[n]), y[n])
+    return recs, pulses, E
+
+
+def plan_pvq(A, E, b, mant, sr, n2, width, k_cap=0):
+    """Per-band records for one frame, the samples to play, and the exponents to store.
+
+    A record is None on a band that stays scalar. Claimed bands are (q, y). The
+    returned exponents are the band-energy exponents on those bands and the
+    caller's exponents everywhere else, which is what write_frame has to send:
+    the decoder rebuilds the gain from that exponent and q.
+    """
+    A = np.asarray(A, np.float64)
+    recs, pulses, E = plan_pvq_frames(
+        A.reshape(1, A.shape[0], A.shape[1]),
+        np.asarray(E).reshape(1, -1),
+        np.asarray(b).reshape(1, -1),
+        k_cap=k_cap)
+    return recs[0], pulses[0], E[0]
+
+
+def pvq_bands_cost(recs, b):
+    """Bits write_frame will spend on the pyramid bands of one frame."""
+    tot = 0
+    b = np.asarray(b)
+    for j, rec in enumerate(recs):
+        if rec is None:
+            continue
+        _q, y = rec
+        k = int(np.abs(y).sum())
+        tot += _gamma_bits(k) + int(b[j]) + _index_bits(int(y.size), k)
+    return tot
+
+
+_MODEL_COST = {}
+
+
+def _model_cost_table(width, hi):
+    """gamma(K) + depth + index bits, for depth 0..hi. K is `pvq_k_for_depth`."""
+    width = int(width)
+    hi = max(int(hi), 0)
+    hit = _MODEL_COST.get(width)
+    if hit is not None and hit.size > hi:
+        return hit
+    top = max(hi, MAX_BITS)
+    table = np.zeros(top + 1, np.int64)
+    for depth in range(1, top + 1):
+        k = pvq_k_for_depth(depth, width)
+        table[depth] = _gamma_bits(k) + depth + _index_bits(width, k)
+    _MODEL_COST[width] = table
+    return table
+
+
+def pvq_model_costs(band_bits, width):
+    """Per-frame pyramid bits the rate model charges.
+
+    Same total as `pvq_bands_cost` on a stand-in that puts all K pulses in the
+    first bin. The real encoder places those pulses, and the count it writes is
+    this K unless a band runs out of energy first. One payload sample corrects
+    that. Depth 0 is not a pyramid.
+    """
+    b = np.asarray(band_bits, np.int64)
+    if b.size == 0:
+        return np.zeros(b.shape[0], np.int64)
+    table = _model_cost_table(width, int(b.max()))
+    return table[b].sum(axis=1)
+
+
+def write_pvq_bands(w, recs, b):
+    for j, rec in enumerate(recs):
+        if rec is None:
+            continue
+        q, y = rec
+        y = np.asarray(y, np.int64)
+        k = int(np.abs(y).sum())
+        _write_gamma(w, max(k, 1))
+        w.put(int(q), int(b[j]))
+        idx, ncode = pvq_index(y)
+        bits = (ncode - 1).bit_length() if ncode > 1 else 0
+        if bits:
+            _put_wide(w, idx, bits)
+
+
+def read_pvq_band(r, width, E, b):
+    k = _read_gamma(r)
+    q = r.get(int(b))
+    ncode = pvq_count(width, k)
+    bits = (ncode - 1).bit_length() if ncode > 1 else 0
+    idx = r.get(bits) if bits else 0
+    y = pvq_from_index(idx, width, k)
+    return pvq_synth_band(y, q, E, b)
+
+
 def fill_codes_all(A3all, ball, thr_all=None, mode="safe"):
     """
     Per-frame transport words for a whole file, derived only from the analysis, the mask and the
@@ -668,7 +1547,8 @@ def fill_codes_all(A3all, ball, thr_all=None, mode="safe"):
     return out
 
 
-def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width, fill=None, shape=None):
+def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width, fill=None, shape=None,
+                pvq=None):
     """
     Append one frame's bands to `w`. The writer is told E, b and the mantissas and invents
     nothing: the encoder derives them with quantise_bands, and what the writer serialises is
@@ -772,15 +1652,21 @@ def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width, fill=None, sh
     b1 = np.maximum(b, 1)
     cost_gap = cb + n_cnt * (gb + 1 + b1)
     cost_flat = width * (1 + b1)
-    flat = live & (cost_flat < cost_gap)
-    sizes = np.where(live, 1 + np.where(flat, cost_flat, cost_gap), 0)
+    # Pyramid bands are not in this field. With the flag clear, pack is every live band and
+    # the bits are the ones this function has always written.
+    pack = live
+    if pvq is not None:
+        claimed = np.array([rec is not None for rec in pvq], dtype=bool)
+        pack = live & ~claimed
+    flat = pack & (cost_flat < cost_gap)
+    sizes = np.where(pack, 1 + np.where(flat, cost_flat, cost_gap), 0)
     start = np.zeros_like(sizes)
     start[1:] = np.cumsum(sizes)[:-1]
     total = int(sizes.sum())
     if total:
         out = np.zeros(total, np.uint8)
-        scatter(out, flat[live].astype(np.int64), np.ones(int(live.sum()), np.int64), start[live])
-        jg = np.flatnonzero(live & ~flat)
+        scatter(out, flat[pack].astype(np.int64), np.ones(int(pack.sum()), np.int64), start[pack])
+        jg = np.flatnonzero(pack & ~flat)
         jf = np.flatnonzero(flat)
         if jg.size:
             scatter(out, n_cnt[jg], np.full(jg.size, cb, np.int64), start[jg] + 1)
@@ -806,6 +1692,12 @@ def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width, fill=None, sh
             scatter(out, vals.reshape(-1), np.repeat(wv, width, axis=1).reshape(-1),
                     (start[jf][:, None] + 1 + c2[None, :] * wv).reshape(-1))
         w.put_bits(out)
+    # Live bands, in band order, where the scalar mantissas would have been.
+    npvq = 0
+    if pvq is not None:
+        t_pvq = w.bits()
+        write_pvq_bands(w, pvq, b)
+        npvq = w.bits() - t_pvq
     # The fill field, last, because its run structure is derived from b and the decoder only
     # knows b after reading the counts. Nothing new is invented here: these are the very codes
     # the encoder synthesised with, so the bits and the sound cannot disagree.
@@ -824,17 +1716,19 @@ def write_frame(w, E_band, b_band, mant, prev_E, prev_bits, width, fill=None, sh
         nshape = w.bits() - t4
     # E is returned as the decoder's own state: live bands updated, dead ones parked. Handing
     # this back is what makes the retention rule the same in both directions.
-    return E_next, (t2 - t1, t1 - t0, w.bits() - t2 - nfill - nshape, nfill, nshape)
+    return E_next, (t2 - t1, t1 - t0, w.bits() - t2 - nfill - nshape - npvq,
+                    nfill, nshape, npvq)
 
 
-def frame_costs(Eall, ball, mant, width, fill_levels=None, shape_fields=None):
+def frame_costs(Eall, ball, mant, width, fill_levels=None, shape_fields=None,
+                pvq_frames=None, pvq_costs=None):
     """
     What one frame's fields cost, in bits, computed without writing a single bit.
 
     This exists because a rate search has no business encoding the file 15 times to answer a
     question that is arithmetic: the mantissa field is a count plus (gap, sign, magnitude) per
     nonzero, and the two delta fields are Rice codewords whose lengths are known the moment k
-    is chosen. Returns (scale, bits, mantissa, fill, shape) totals over the given frames.
+    is chosen. Returns (scale, bits, mantissa, fill, shape, pvq) totals over the given frames.
 
     The numbers have to match write_frame's byte measurement. That is checked against a packed
     payload in the round trip, not assumed, because an estimator that quietly drifts would
@@ -842,7 +1736,7 @@ def frame_costs(Eall, ball, mant, width, fill_levels=None, shape_fields=None):
     """
     gb, cb = gap_bits(width), count_bits(width)
     nfr = len(Eall)
-    tot = np.zeros(5, np.int64)
+    tot = np.zeros(6, np.int64)
     prev_E = np.zeros(len(ball[0]), np.int64)
     prev_b = np.zeros(len(ball[0]), np.int64)
     for f in range(nfr):
@@ -868,11 +1762,24 @@ def frame_costs(Eall, ball, mant, width, fill_levels=None, shape_fields=None):
             k = pick_k(zE)
             _, wdE = rice_fields(zE, k)
             tot[0] += 5 + int(wdE.sum())
-        n = (mant[f] != 0).sum(axis=1)
-        b1 = np.maximum(b, 1)
-        # the cheaper of the two band shapes, plus the flag that chooses between them
-        per = 1 + np.minimum(cb + n * (gb + 1 + b1), width * (1 + b1))
-        tot[2] += int(np.where(live, per, 0).sum())
+        # The cheaper of the two band shapes, plus the flag that chooses between them.
+        # A pyramid band is not in this sum: its bits are the sixth field, and the mask is
+        # the records the writer was given, which is how the two stay on the same bands.
+        # pvq_costs is that sixth field already summed per frame, for the rate model,
+        # where every live band is a pyramid and the pulse count comes from the depth.
+        scalar = live
+        if pvq_costs is not None:
+            tot[5] += int(pvq_costs[f])
+            scalar = None
+        elif pvq_frames is not None:
+            claimed = np.array([rec is not None for rec in pvq_frames[f]], dtype=bool)
+            scalar = live & ~claimed
+            tot[5] += pvq_bands_cost(pvq_frames[f], b)
+        if scalar is not None:
+            n = (mant[f] != 0).sum(axis=1)
+            b1 = np.maximum(b, 1)
+            per = 1 + np.minimum(cb + n * (gb + 1 + b1), width * (1 + b1))
+            tot[2] += int(np.where(scalar, per, 0).sum())
         if fill_levels is not None:
             tot[3] += fill_cost(b, fill_levels[f])
         if shape_fields is not None:
@@ -881,7 +1788,8 @@ def frame_costs(Eall, ball, mant, width, fill_levels=None, shape_fields=None):
     return tot
 
 
-def read_frame(r, prev_E, prev_bits, width, fill=False, shape=False, reg=None):
+def read_frame(r, prev_E, prev_bits, width, fill=False, shape=False, reg=None,
+               pvq=False, sr=0, n2=0, sblock=SHAPE_BLOCK):
     """
     The mirror of write_frame, and the only path a decoder takes. It returns E, b and the
     mantissas; the caller reconstructs with reconstruct_bands, which is the same function the
@@ -894,7 +1802,11 @@ def read_frame(r, prev_E, prev_bits, width, fill=False, shape=False, reg=None):
     infer that a stream was made with a fill on.
 
     shape=True is the fifth field, read after the fill and derived from the same b. The region
-    comes from reg = shape_reg(...), which is computed, not sent.
+    comes from reg = shape_reg(...), which is computed, not sent. How wide each of its words is
+    comes from sblock, which is the header's business too - see shape_block.
+
+    pvq=True means every live band is a pyramid vector, read in place of its scalar
+    mantissas. sr and n2 are the header's. Dead-band noise after that is unchanged.
     """
     # The counts field, both shapes, mirrored from write_frame. A prefix-free code decides the
     # rest of the frame, so a decoder never has to guess whether a list follows.
@@ -932,30 +1844,45 @@ def read_frame(r, prev_E, prev_bits, width, fill=False, shape=False, reg=None):
     # inner read and the only difference is whether positions are spelled out.
     mant = np.zeros((len(b), width), np.int64)
     gb, cb = gap_bits(width), count_bits(width)
+    claims = pvq_claims(b) if pvq else None
     for j in range(len(b)):
         if b[j] <= 0:
             continue
+        if claims is not None and claims[j]:
+            continue
         bw = max(int(b[j]), 1)
         lim = (1 << bw) - 1
+        step = 1 + bw
+        mask = (1 << step) - 1
         if r.get(1):
-            base = -1
+            # Flat: every bin is the same width, so the band is one integer and the split
+            # stays in this loop. Sixteen get() calls were most of read_frame at a full band.
+            blob = r.take(width * step)
+            shift = width * step
+            row = mant[j]
             for i in range(width):
-                v = r.get(1 + bw)
-                mant[j, i] = -(v & lim) if (v >> bw) else (v & lim)
+                shift -= step
+                v = (blob >> shift) & mask
+                row[i] = -(v & lim) if (v >> bw) else (v & lim)
             continue
         n = r.get(cb)
         base = -1
         for _ in range(n):
             i = base + 1 + r.get(gb)
-            v = r.get(1 + bw)
+            v = r.get(step)
             mant[j, i] = -(v & lim) if (v >> bw) else (v & lim)
             base = i
-    if fill or shape:
+    pulses = None
+    if pvq:
+        pulses = np.zeros((len(b), width), np.float64)
+        for j in np.flatnonzero(claims):
+            pulses[j] = read_pvq_band(r, width, int(E[j]), int(b[j]))
+    if fill or shape or pvq:
         codes = read_fill(r, b) if fill else None
+        words = read_shape(r, b, reg, sblock) if shape else None
+        if pvq:
+            return E, b, mant, codes, words, pulses
         if shape:
-            words = read_shape(r, b, reg)
-            if fill:
-                return E, b, mant, codes, words
             return E, b, mant, codes, words
         return E, b, mant, codes
     return E, b, mant
@@ -974,10 +1901,31 @@ HEADER_FMT = "<4sBIBHHIIII"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 
-def pack_header(sr, nch, n2, width, n_samples, budget, payload_lens, flags=0):
+def playback_gain(peak, ceiling=1.0):
+    """The linear gain that puts `peak` on `ceiling`, or 1 when it is already under.
+
+    Stored as the float32 the header will write. That rounding can land a hair over the
+    ceiling, so the value is stepped down until peak times gain fits. A non-positive
+    ceiling means the caller is leaving the level alone.
+    """
+    if ceiling <= 0 or not np.isfinite(peak) or peak <= ceiling:
+        return 1.0
+    g = np.float32(ceiling / peak)
+    while peak * float(g) > ceiling and g > np.float32(0):
+        g = np.nextafter(g, np.float32(0.0))
+    return float(g)
+
+
+def pack_header(sr, nch, n2, width, n_samples, budget, payload_lens, flags=0, gain=1.0):
+    gain = float(gain)
+    if gain < 1.0:
+        flags |= GAIN_FLAG
     h = struct.pack(HEADER_FMT, MAGIC, VERSION, int(sr), int(nch), int(n2), int(width),
                     int(n_samples), int(budget), len(payload_lens), int(flags))
-    return h + b"".join(struct.pack("<I", int(L)) for L in payload_lens)
+    h += b"".join(struct.pack("<I", int(L)) for L in payload_lens)
+    if flags & GAIN_FLAG:
+        h += struct.pack("<f", np.float32(gain))
+    return h
 
 
 def unpack_header(h):
@@ -987,11 +1935,173 @@ def unpack_header(h):
         raise ValueError(f"not an RSC3 file: {magic!r}")
     if ver != VERSION:
         raise ValueError(f"unsupported RSC3 version {ver}")
-    lens = [struct.unpack("<I", h[HEADER_SIZE + 4 * i:HEADER_SIZE + 4 * (i + 1)])[0]
-            for i in range(n_pl)]
+    off = HEADER_SIZE
+    lens = [struct.unpack("<I", h[off + 4 * i:off + 4 * (i + 1)])[0] for i in range(n_pl)]
+    off += 4 * n_pl
+    gain = 1.0
+    if flags & GAIN_FLAG:
+        gain = float(struct.unpack("<f", h[off:off + 4])[0])
+        off += 4
     return dict(sr=sr, nch=nch, n2=n2, width=width, n_samples=int(n_samp),
-                budget=int(budget), lens=lens, flags=int(flags),
-                body_off=HEADER_SIZE + 4 * n_pl)
+                budget=int(budget), lens=lens, flags=int(flags), gain=gain,
+                body_off=off)
+
+
+def _ms_fold(row):
+    """One decision per `MS_GROUP` bands. Each group in `row` has to agree."""
+    row = np.asarray(row, np.uint8).reshape(-1) & np.uint8(1)
+    g = MS_GROUP
+    n = int(row.size)
+    if g <= 1:
+        return row
+    if n % g:
+        raise ValueError(f"mid/side mask length {n} is not a multiple of {g}")
+    blocks = row.reshape(-1, g)
+    if np.any(blocks != blocks[:, :1]):
+        raise ValueError("mid/side mask changes inside a group of bands")
+    return np.ascontiguousarray(blocks[:, 0])
+
+
+def _ms_choice(row):
+    """How `write_ms` stores one frame of decisions.
+
+    0 is left/right and 2 is mid/side, each two bits. A mixed frame is whichever
+    of the two lists is shorter: a bit per group (mode 1), or the smaller set of
+    group numbers (mode 3). A tie in that set lists the mid/side groups.
+    `row` is already one entry per group.
+    """
+    row = np.asarray(row, np.uint8).reshape(-1) & np.uint8(1)
+    n = int(row.size)
+    if n == 0 or not np.any(row):
+        return 0, True, np.zeros(0, np.int64)
+    if np.all(row):
+        return 2, True, np.zeros(0, np.int64)
+    ms_at = np.flatnonzero(row)
+    k_ms = int(ms_at.size)
+    if k_ms <= n - k_ms:
+        listed = ms_at.astype(np.int64)
+        list_is_ms = True
+        k = k_ms
+    else:
+        listed = np.flatnonzero(row == 0).astype(np.int64)
+        list_is_ms = False
+        k = n - k_ms
+    sparse = 2 + 1 + count_bits(n) + k * gap_bits(n)
+    if sparse < 2 + n:
+        return 3, list_is_ms, listed
+    return 1, True, np.zeros(0, np.int64)
+
+
+def _ms_row_bits(row):
+    """Bits for one frame of decisions. `row` is already one entry per group."""
+    row = np.asarray(row).reshape(-1)
+    mode, _, listed = _ms_choice(row)
+    if mode in (0, 2):
+        return 2
+    if mode == 1:
+        return 2 + int(row.size)
+    return 2 + 1 + count_bits(row.size) + int(listed.size) * gap_bits(row.size)
+
+
+def ms_bits(row):
+    """Bits `write_ms` spends on one frame's mask."""
+    return _ms_row_bits(_ms_fold(row))
+
+
+def write_ms(w, row):
+    """The mask for one frame, one decision per `MS_GROUP` bands.
+
+    See `_ms_choice` for which shape gets written. The row is the per-band
+    mask, and every band in a group carries the same decision.
+    """
+    row = _ms_fold(row)
+    mode, list_is_ms, listed = _ms_choice(row)
+    w.put(mode, 2)
+    if mode == 1:
+        w.put_bits(row & np.uint8(1))
+    elif mode == 3:
+        n = int(row.size)
+        w.put(0 if list_is_ms else 1, 1)
+        w.put(int(listed.size), count_bits(n))
+        if listed.size:
+            gaps = np.empty(listed.size, np.int64)
+            gaps[0] = listed[0]
+            if listed.size > 1:
+                gaps[1:] = listed[1:] - listed[:-1] - 1
+            w.put_fields(gaps, np.full(listed.size, gap_bits(n), np.int64))
+    return _ms_row_bits(row)
+
+
+def read_ms(r, nbands):
+    """The mask `write_ms` stored. 1 where that band was coded mid/side.
+
+    The file has one decision per `MS_GROUP` bands. This repeats it so the
+    caller still has one entry per band.
+    """
+    g = MS_GROUP
+    n_full = int(nbands)
+    if g > 1 and n_full % g:
+        raise ValueError(f"mid/side band count {n_full} is not a multiple of {g}")
+    n = n_full // g if g > 1 else n_full
+    mode = r.get(2)
+    if mode == 0:
+        out = np.zeros(n, np.uint8)
+    elif mode == 2:
+        out = np.ones(n, np.uint8)
+    elif mode == 1:
+        out = np.empty(n, np.uint8)
+        i = 0
+        while i < n:
+            take = 16 if n - i > 16 else n - i
+            v = r.get(take)
+            for k in range(take):
+                out[i + k] = (v >> (take - 1 - k)) & 1
+            i += take
+    elif mode == 3:
+        list_is_ms = r.get(1) == 0
+        k = r.get(count_bits(n))
+        out = np.zeros(n, np.uint8) if list_is_ms else np.ones(n, np.uint8)
+        gb = gap_bits(n)
+        pos = -1
+        for _ in range(k):
+            pos += 1 + r.get(gb)
+            if pos < 0 or pos >= n:
+                raise ValueError(f"mid/side group {pos} outside 0..{n - 1}")
+            out[pos] = 1 if list_is_ms else 0
+    else:
+        raise ValueError(f"mid/side mode {mode}")
+    if g > 1:
+        return np.repeat(out, g)
+    return out
+
+
+def ms_rotate(L, R, use, width=16):
+    """Mid and side on the bands `use` marks. Mid is (L+R)/sqrt(2).
+
+    The scale keeps the band's total energy, so the waterfill sees the same
+    loudness it would have split across left and right. A band left unmarked
+    is copied through unchanged.
+    """
+    width = int(width)
+    Ls = np.asarray(L, np.float64).reshape(L.shape[0], -1, width)
+    Rs = np.asarray(R, np.float64).reshape(R.shape[0], -1, width)
+    u = np.asarray(use, bool)[..., None]
+    mid = (Ls + Rs) * _MS_SCALE
+    side = (Ls - Rs) * _MS_SCALE
+    return (np.where(u, mid, Ls).reshape(L.shape),
+            np.where(u, side, Rs).reshape(R.shape))
+
+
+def ms_unrotate(M, S, use, width=16):
+    """Inverse of `ms_rotate`. Same scale, so an unquantized pair comes back exactly."""
+    width = int(width)
+    Ms = np.asarray(M, np.float64).reshape(M.shape[0], -1, width)
+    Ss = np.asarray(S, np.float64).reshape(S.shape[0], -1, width)
+    u = np.asarray(use, bool)[..., None]
+    left = (Ms + Ss) * _MS_SCALE
+    right = (Ms - Ss) * _MS_SCALE
+    return (np.where(u, left, Ms).reshape(M.shape),
+            np.where(u, right, Ss).reshape(S.shape))
 
 
 def frame_count(n_samples, n2):

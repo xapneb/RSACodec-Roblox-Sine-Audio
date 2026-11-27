@@ -9,9 +9,9 @@ Everything here is measured, not assumed:
   y = w * (2/N) C X, and windowed overlap-add is exact to ~1e-15 (see transform_check.py).
   Both directions run through one complex DFT, so this is the form a Luau decoder would port.
 * A full-scale sine measures |X| = N/2 (measured to 0.3%), so `amplitude()` puts coefficients
-  in dBFS-comparable units. Every perceptual threshold below is stated in dB relative to full
-  scale for exactly that reason: an ATH gate applied to frame-relative magnitudes is a gate that
-  moves with the signal and quietly deletes quiet passages.
+  in dBFS-comparable units. Every perceptual threshold below is in those units. The threshold
+  is the simultaneous mask. A flat floor stands in only where no masker reaches, so a silent
+  bin is not chased downward and a hearing curve cannot delete a band the rate can carry.
 * The quantiser is the classical scalefactor + mantissa split, so the model's 6.02 dB/bit
   assumption is true of the output rather than merely asserted.
 
@@ -25,13 +25,46 @@ from numpy.lib.stride_tricks import sliding_window_view
 MAX_BITS_PER_COEF = 16
 BAND_WIDTH = 16                      # coefficients per scalefactor band
 CHUNK = 128                          # frames per vectorized batch
+# No-masker floor, dBFS. Simultaneous masking is the threshold wherever a real masker
+# reaches. This only replaces the "nothing is masking" sentinel: 16-bit dither sits near
+# -96 dBFS, and -120 stops the waterfill short of numerical silence. It is not a hearing
+# curve. The old absolute-threshold table ended at 16 kHz and was held there, which pinned
+# everything above that to about -36 dBFS and made those bands illegal at any bitrate.
+QUIET_FLOOR_DBFS = -120.0
 
 
 # ---------------------------------------------------------------- transform
 
+_WIN = {}
+_DCT4 = {}
+
+
 def window(N2):
-    """Lapped analysis/synthesis window, length N2 = 2N."""
-    return np.sin(np.pi * (np.arange(N2) + 0.5) / N2)
+    """Lapped analysis/synthesis window, length N2 = 2N. Tabulated: every frame uses the same one."""
+    w = _WIN.get(N2)
+    if w is None:
+        w = np.sin(np.pi * (np.arange(N2) + 0.5) / N2)
+        _WIN[N2] = w
+    return w
+
+
+def _dct4_tabs(L):
+    """The three twiddles and the even/odd index, once per length. Same values dct4 used to
+    build on every call, so a cached table does not move a coefficient."""
+    tab = _DCT4.get(L)
+    if tab is None:
+        m = np.arange(L)
+        r = np.arange(L // 2)
+        tab = (
+            np.exp(1j * np.pi * m / (2 * L)),
+            np.exp(1j * np.pi * m / L),
+            np.exp(1j * np.pi * (m + 0.5) / (2 * L)),
+            r,
+            2 * r,
+            2 * r + 1,
+        )
+        _DCT4[L] = tab
+    return tab
 
 
 def dct4(v):
@@ -40,16 +73,17 @@ def dct4(v):
         C_k = 2 Re( e^{i pi (k+0.5)/(2L)} * sum_m v_m e^{i pi m/(2L)} e^{i pi m k / L} )
     which is two half-used inverse DFTs, i.e. one length-L complex FFT's worth of work.
     Verified against scipy's DCT-IV to 1e-15 for L = 8 .. 2048. Works on any stack of rows.
+
+    A single length-L/2 FFT reaches the same cosine and runs faster, and it disagrees with
+    this one by ~1e-13 at L = 2048. That is enough to move a mantissa sitting on a rounding
+    boundary, so the transform that already matches the kernel stays.
     """
     L = v.shape[-1]
-    m = np.arange(L)
-    q = v * np.exp(1j * np.pi * m / (2 * L))
+    e1, e2, tw, r, ke, ko = _dct4_tabs(L)
+    q = v * e1
     A = np.fft.ifft(q, axis=-1) * L                       # output bins k = 0, 2, 4, ...
-    B = np.fft.ifft(q * np.exp(1j * np.pi * m / L), axis=-1) * L   # bins 1, 3, 5, ...
-    tw = np.exp(1j * np.pi * (np.arange(L) + 0.5) / (2 * L))
+    B = np.fft.ifft(q * e2, axis=-1) * L                  # bins 1, 3, 5, ...
     C = np.empty(v.shape, float)
-    r = np.arange(L // 2)
-    ke, ko = 2 * r, 2 * r + 1
     C[..., ke] = 2 * (tw[ke] * np.take(A, r, axis=-1)).real
     C[..., ko] = 2 * (tw[ko] * np.take(B, r, axis=-1)).real
     return C
@@ -142,30 +176,6 @@ def amplitude(X, N2):
 
 
 # ------------------------------------------------------------- psychoacoustics
-
-# Absolute threshold of hearing, measured table (same curve RSC2's psycho layer uses). An
-# analytic fit is what wrecked the first version of this file: the usual polynomial forms
-# diverge at HF, mask the entire top of the spectrum and silently produce a silent codec.
-_AT_HZ = np.array([20.0, 31.5, 50.0, 100.0, 200.0, 300.0, 500.0, 1000.0, 2000.0, 3000.0,
-                   4000.0, 5000.0, 6000.0, 8000.0, 10000.0, 12500.0, 16000.0])
-_AT_SPL = np.array([72.0, 54.0, 40.0, 27.0, 17.0, 12.0, 7.0, 3.0, 1.0, -1.0,
-                    1.0, 4.0, 8.0, 15.0, 24.0, 36.0, 60.0])
-
-
-def ath_db(n_coefs, sr):
-    """ISO-226-shaped audibility floor, dB SPL."""
-    hz = np.maximum(np.arange(n_coefs) * sr / (2 * n_coefs), _AT_HZ[0])
-    return np.interp(hz, _AT_HZ, _AT_SPL)
-
-
-def ath_dbfs(n_coefs, sr, spl_ref=96.0):
-    """
-    That floor in dBFS for this codec's amplitude units. spl_ref is the SPL a full-scale
-    sample is assumed to play back at, so the reference is a stated assumption about listening
-    level, not a property of the audio; 96 dB SPL corresponds to loud 16-bit playback.
-    """
-    return ath_db(n_coefs, sr) - spl_ref
-
 
 def _erb_rate(n_coefs, sr):
     """ERB-rate axis (21.4 log10(1 + 0.006 f), f in Hz). One convention, on purpose: two
@@ -319,19 +329,23 @@ def band_edges(n_coefs, width=BAND_WIDTH):
 
 def threshold_dbfs(A_db, sr, n_coefs=None, psycho=True, spl_ref=96.0, **kw):
     """
-    The highest noise level that stays inaudible at each coefficient of one frame, or of a
-    stack of frames: the audibility floor, raised wherever a real masker puts maskers there.
-    psycho=False keeps only ATH, which is the blind baseline the model has to beat to be worth
-    its complexity.
+    The highest noise level that stays masked at each coefficient of one frame, or of a stack
+    of frames. With psycho on, that level is the simultaneous-masking curve from `mask_db`.
+    Where no masker reaches, the curve falls away and `QUIET_FLOOR_DBFS` takes over.
+
+    psycho=False is the blind arm: the same flat floor and no frequency masking, so allocation
+    follows level alone. spl_ref is accepted and ignored. It used to slide a hearing curve,
+    and that curve is gone.
     """
+    del spl_ref
     if n_coefs is None:
         n_coefs = A_db.shape[-1]
-    ath = ath_dbfs(n_coefs, sr, spl_ref)
+    floor = np.full(n_coefs, QUIET_FLOOR_DBFS)
     if not psycho:
-        return np.broadcast_to(ath, A_db.shape).copy() if A_db.ndim > 1 else ath
+        return np.broadcast_to(floor, A_db.shape).copy() if A_db.ndim > 1 else floor.copy()
     m = mask_db(A_db, sr, n_coefs, **kw)
     m = np.atleast_2d(m) if A_db.ndim > 1 else m
-    return np.maximum(ath, m)
+    return np.maximum(floor, m)
 
 
 def _band_level_db(A_db, edges):
@@ -401,55 +415,122 @@ def _waterfill_all(A_db, threshold_db, band_level_db, budget_bits):
     return best
 
 
-def waterfill_select(A_db, threshold_db, band_level_db, budget_bits, max_bits=MAX_BITS_PER_COEF):
+def ear_filter_share_db(level_db, hz, share=0.5):
+    """Half the level of the auditory filter each band sits in, in dB.
+
+    Filters are Glasberg and Moore's cam scale, z = 21.4 log10(1 + 0.00437 f).
+    One cam is one filter. `level_db` is 10 log10 of the band power, which is
+    what the pyramid waterfill already passes as 20 log10 of the band's L2.
+    The masking skirts keep their own 0.006 axis. This scale is only the rank.
+
+    Subtracting the whole filter level was measured to flatten every open band
+    to one plane and lower the filter score (domain, 48 planes, 2.77 dB down
+    to 2.14 dB). Half of it raised that score to 3.28 dB.
     """
-    Water-filling by selecting the price, not by searching for the floor.
+    hz = np.asarray(hz, np.float64)
+    z = 21.4 * np.log10(1.0 + 0.00437 * np.maximum(hz, 1.0))
+    g = np.floor(z).astype(np.int32)
+    power = 10.0 ** (np.asarray(level_db, np.float64) / 10.0)
+    ng = int(g.max()) + 1
+    nfr = power.shape[0]
+    acc = np.zeros((nfr, ng), np.float64)
+    np.add.at(acc, (np.arange(nfr)[:, None], np.broadcast_to(g, power.shape)), power)
+    gdb = 10.0 * np.log10(np.maximum(acc, 1e-30))
+    return float(share) * gdb[:, g]
 
-    The quantity being solved is a step function, not a smooth one, so a search is the wrong
-    shape of algorithm. Bit b of band k exists while max(T_k, floor) < S_k - 6.02(b-1), which
-    says: that expression is the *price* of the b-th bit, raise the floor past a price and you
-    lose that bit and only that bit. So the frame's total is just a count of prices above the
-    floor, it is monotone in the floor, and the lowest floor that fits a budget is the
-    (budget+1)-th largest price. Linear selection instead of sixty passes over the frame.
 
-    Two details the bisection handled implicitly and a selection must not forget:
-      * a price at or below its own bin's threshold is unreachable, because floor_k is
-        max(T_k, floor) and is always at least T_k there. Leaving those in counts free bits
-        the frame can never collect, and it inflates the budget the frame thinks it spent.
-      * a bin cannot be charged for bits beyond its own level: the b-th bit also requires
-        floor < A_k, which is why the price is capped at min(price, A_k). Without the cap,
-        masked bins get quantised with the coarse step their bits would buy and add noise
-        above what they were hiding - the exact failure that capped a pure tone at 14.5 dB.
-
-    `band_level_db` must already be floored at the threshold, so band_level >= threshold.
+def waterfill_select(A_db, threshold_db, band_level_db, budget_bits, max_bits=MAX_BITS_PER_COEF,
+                     share_db=None):
     """
+    Which bits a frame can afford.
+
+    A bit's price is its level, S - 6.02*(b-1). `share_db` is subtracted from
+    that when the caller has one. Pyramid bands pass half the level of the
+    auditory filter the band sits in, so a band is priced as part of that
+    filter. Without it the price is the raw level.
+
+    A price at or below a bin's own threshold is not for sale, and a bit past
+    the bin's own level is not either. Both of those buy quantisation noise
+    above what the bin was hiding. The sale check stays on the raw level.
+    `band_level_db` must already be floored at the threshold.
+    """
+    # Chunked, and the price table of a chunk is discarded. Holding every frame's prices
+    # is about a gigabyte on a long file, which is the batch this codec already stopped doing.
     step = 6.02
     b = np.arange(1, max_bits + 1, dtype=np.float64)
     out = np.zeros(A_db.shape, np.int16)
+    nc = A_db.shape[1]
     for s in range(0, A_db.shape[0], CHUNK):
         e = min(s + CHUNK, A_db.shape[0])
-        S = band_level_db[s:e, None, :, None]
-        A = A_db[s:e, None, :, None]
-        thr = threshold_db[s:e, None, :, None]
-        price = S - step * (b[None, None, None, :] - 1.0)
-        price = np.where((thr < price) & (A > thr), np.minimum(price, A), -np.inf)
-        flat = price.reshape(e - s, -1)
-        j = min(budget_bits, flat.shape[1] - 1)
-        floor = -np.partition(-flat, j, axis=1)[:, j]
-        got = flat > floor[:, None]
-        out[s:e] = got.reshape(e - s, A_db.shape[1], max_bits).sum(axis=2).astype(np.int16)
+        part = None if share_db is None else share_db[s:e]
+        flat = _price_chunk(A_db[s:e], threshold_db[s:e], band_level_db[s:e], b, step, part)
+        out[s:e] = bits_from_prices(flat, budget_bits, nc, max_bits)
     return out
 
 
-def allocate(A, sr, budget_bits, psycho=True, spl_ref=96.0, edges=None, search=False):
+def _price_chunk(A_db, threshold_db, band_level_db, b, step, share_db=None):
+    """Level, in dB, of bits 1..max. -inf where the bit cannot be bought.
+
+    `share_db` is per bin and is removed from the rank only. The threshold
+    test stays on the raw level, so a masked bin cannot become legal by sitting
+    in a quiet filter.
+    """
+    S = band_level_db[:, None, :, None]
+    A = A_db[:, None, :, None]
+    thr = threshold_db[:, None, :, None]
+    level = S - step * (b[None, None, None, :] - 1.0)
+    legal = (thr < level) & (A > thr)
+    if share_db is not None:
+        level = level - np.asarray(share_db, np.float64)[:, None, :, None]
+    return np.where(legal, level, -np.inf).reshape(A_db.shape[0], -1)
+
+
+def waterfill_prices(A_db, threshold_db, band_level_db, max_bits=MAX_BITS_PER_COEF):
+    """Price of every legal bit, shape (frames, coefficients * max_bits), chunked so the
+    4-wide temporary stays inside a block of CHUNK frames."""
+    step = 6.02
+    b = np.arange(1, max_bits + 1, dtype=np.float64)
+    nfr = A_db.shape[0]
+    flat = np.empty((nfr, A_db.shape[1] * max_bits), np.float64)
+    for s in range(0, nfr, CHUNK):
+        e = min(s + CHUNK, nfr)
+        flat[s:e] = _price_chunk(A_db[s:e], threshold_db[s:e], band_level_db[s:e], b, step)
+    return flat
+
+
+def bits_from_prices(flat, budget_bits, ncoefs, max_bits=MAX_BITS_PER_COEF, sorted_asc=None):
+    """How many of each coefficient's prices sit strictly above the (budget+1)th largest.
+
+    `sorted_asc` is `np.sort(flat, axis=1)` when the caller is about to ask this of many
+    budgets. Ties at the rank are left unbought.
+    """
+    nfr, n = flat.shape
+    j = min(int(budget_bits), n - 1)
+    if sorted_asc is None:
+        floor = -np.partition(-flat, j, axis=1)[:, j]
+    else:
+        floor = sorted_asc[:, n - 1 - j]
+    got = flat > floor[:, None]
+    return got.reshape(nfr, ncoefs, max_bits).sum(axis=2).astype(np.int16)
+
+
+def allocate(A, sr, budget_bits, psycho=True, spl_ref=96.0, edges=None, search=False,
+             A_db=None, thr=None):
     """
     Bits per (frame, coefficient). A is `amplitude()`-converted coefficients, one row per frame.
+
+    A_db and thr are the log magnitude and the masking threshold, when the caller already
+    has them. The fill ceiling is that same threshold, and recomputing it is a second mask
+    for a number this function just threw away. Passing them in is optional: omitted, they
+    are computed here, and the bits are the bits either way.
     """
     n_coefs = A.shape[1]
     if edges is None:
         edges = band_edges(n_coefs)
-    A_db = 20 * np.log10(np.maximum(np.abs(A), 1e-30))
-    thr = threshold_dbfs(A_db, sr, n_coefs, psycho, spl_ref)
+    if A_db is None:
+        A_db = 20 * np.log10(np.maximum(np.abs(A), 1e-30))
+    if thr is None:
+        thr = threshold_dbfs(A_db, sr, n_coefs, psycho, spl_ref)
     blevel = _band_level_db(A_db, edges)
     bl = np.maximum(blevel, thr)
     if search:
