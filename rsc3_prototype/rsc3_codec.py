@@ -322,8 +322,14 @@ def mask_db(Xdb, sr, n_coefs, spread_up=10.0, spread_down=25.0, scale=0.15,
 
 # ---------------------------------------------------------------- allocation
 
-def band_edges(n_coefs, width=BAND_WIDTH):
-    """Contiguous coefficient groups sharing one scalefactor."""
+def band_edges(n_coefs, width=None):
+    """Contiguous coefficient groups sharing one scalefactor.
+
+    `width` is read from the module when it is not given, rather than bound when the function was
+    defined, because the encoder is allowed to pick a band width per file and a default frozen at
+    import time is how it ends up grouping coefficients one way and spending bits another.
+    """
+    width = BAND_WIDTH if width is None else int(width)
     return np.unique(np.concatenate([[0], np.arange(width, n_coefs + 1, width), [n_coefs]]))
 
 

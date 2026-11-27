@@ -27,6 +27,12 @@ import rsc3_stream as st
 
 N2 = 4096
 WIDTH = r3.BAND_WIDTH
+# The band width `auto` picks, and the widest one this codec can write. The second is a hard
+# limit, not a preference: a pyramid shape is written over a whole band, and the count table only
+# reaches so many bins, so a wider band is a file whose shape field has no codebook. 32 is where
+# that table stops today, which is why the rule below cannot simply go wider.
+BAND_AUTO = 32
+BAND_MAX = st._PVQ_N if hasattr(st, "_PVQ_N") else WIDTH
 
 
 def read_wav(path):
@@ -233,7 +239,7 @@ def band_bits(A, sr, budget, psycho=True, A_db=None, thr=None, pvq=False):
 MS_QUIET = 0.1
 
 
-def ms_mask(L, R, width=WIDTH, quiet=MS_QUIET, group=None):
+def ms_mask(L, R, width=None, quiet=MS_QUIET, group=None):
     """1 where mid/side leaves a clearly quieter channel than left/right.
 
     Mid is (L+R)/sqrt(2) and side is (L-R)/sqrt(2). The test pools `group`
@@ -242,7 +248,7 @@ def ms_mask(L, R, width=WIDTH, quiet=MS_QUIET, group=None):
     splitting it would make two half-loud channels. `quiet` is the fraction
     the coded channel has to beat. 1 keeps any win.
     """
-    width = int(width)
+    width = int(WIDTH if width is None else width)
     group = st.MS_GROUP if group is None else int(group)
     if group < 1:
         raise ValueError(f"mid/side group {group} is not a positive count")
@@ -428,6 +434,12 @@ def main():
     shape.add_argument("--no-fill-shape", dest="fill_shape", action="store_false",
                        help="leave dead high bands to the flat fill")
     ap.set_defaults(fill_shape=None)
+    ap.add_argument("--band-width", dest="band_width", choices=("auto", "16", "32"),
+                    default="auto",
+                    help="bins per scalefactor band. auto (default) is 32, which halves the "
+                         "scale and mask fields against 16 and spends the saving on coefficients"
+                         ", where it buys more than the frequency resolution it gives up. 16 is "
+                         "what every file before this had, for A/B against an old stream")
     ap.add_argument("--pvq", action="store_true",
                     help="each live band is one energy and a pyramid shape over all of "
                          "its bins. Dead bands stay fill or silence. Off unless asked")
@@ -455,6 +467,17 @@ def main():
     args = ap.parse_args()
     if args.fill_shape is None:
         args.fill_shape = args.fill
+    # The other half of the geometry, and it is already a header field, so the decoder takes
+    # whatever is written and no format decision is hiding here. See the rule at BAND_AUTO.
+    global WIDTH
+    if args.band_width == "auto":
+        WIDTH = BAND_AUTO
+    elif int(args.band_width) > BAND_MAX:
+        raise SystemExit(f"band width {args.band_width} is past what the pyramid tables hold "
+                         f"({BAND_MAX}); the encoder would write a file this decoder cannot read")
+    else:
+        WIDTH = int(args.band_width)
+    r3.BAND_WIDTH = WIDTH
     # One geometry for the whole file, chosen before the rate solve so the solve and the
     # payload agree, and written to the header so the decoder reads what was written.
     if args.shape_block == "auto":

@@ -1323,7 +1323,13 @@ PVQ_K_MAX = 64
 # constant: the encoder is choosing K the way it chooses depth, and on this material both land
 # on the same number.
 PVQ_K_TABLE = 256
-_PVQ_N = 16
+# How far the pyramid tables reach in bins, which is not the same question as how wide a band the
+# encoder writes. A band wider than this is coded by the recursive count, and that is exact but it
+# walks a Python stack one pulse deep: a 32-bin band at a low rate recursed nine hundred frames
+# deep and died in the decoder rather than in the encoder, which is the worst place for it, since
+# the encoder's own measure still said the file was good. The reach is therefore a capability the
+# tables have to hold, not a preference about what looks tidy.
+_PVQ_N = 32
 _PVQ_COUNT = {}
 
 
@@ -1635,7 +1641,7 @@ def _k_vec(b, width, k_cap):
     """`pvq_k_for_depth` for many bands. The cost grows with K, so the largest K
     that fits is the count of sizes that fit."""
     b = np.asarray(b, np.int64)
-    if int(width) != _PVQ_N:
+    if int(width) > _PVQ_N:
         return np.array([pvq_k_for_depth(int(v), width, k_cap) for v in b], np.int64)
     bits = np.asarray(_PVQ_BITS[int(width)], np.int64)
     gamma = np.array([_gamma_bits(k) for k in range(PVQ_K_TABLE + 1)], np.int64)

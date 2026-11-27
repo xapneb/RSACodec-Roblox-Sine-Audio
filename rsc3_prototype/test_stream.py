@@ -380,5 +380,29 @@ else:
     check("a band past the old pulse ceiling round-trips", wide >= 45,
           f"{wide} bands at K above {cur.PVQ_K_MAX}, K up to {cur.PVQ_K_TABLE}")
 
+    # A 32-bin band, which is what the encoder writes by default now. The shape field of a band is
+    # a pyramid over all of its bins, so the count table has to reach that wide or the file has a
+    # codebook the decoder was never given. The count is asked for with the recursion limit the
+    # interpreter ships with on purpose: a table that does not reach 32 answers that call by
+    # recursing, and that is what killed the decode of a wide file long before anything was wrong
+    # with the encoder's own numbers.
+    n32 = 32
+    got32 = 0
+    for _ in range(24):
+        y = np.zeros(n32, np.int64)
+        for _ in range(24):
+            j = int(rng.integers(0, n32))
+            y[j] += 1 if (y[j] >= 0 or rng.random() < 0.5) else -1
+        wq = int(rng.integers(1, 7))
+        q = int(rng.integers(0, 1 << wq))
+        wf = cur.Writer()
+        cur.write_pvq_bands(wf, [(q, y)], (wq,))
+        rr = cur.Reader(wf.done())
+        back = cur.read_pvq_band(rr, n32, 0, wq)
+        got32 += int(np.array_equal(back, cur.pvq_synth_band(y, q, 0, wq)))
+    count32 = cur.pvq_count(n32, 24) == cur._PVQ_TAB[n32][24]
+    check("a 32-bin band round-trips", got32 == 24 and count32,
+          f"{got32}/24 bands, and the 32-bin count is in the tables")
+
 print("\n" + ("all checks passed" if not fails else f"{len(fails)} FAILED: {fails}"))
 sys.exit(1 if fails else 0)
