@@ -33,6 +33,16 @@ WIDTH = r3.BAND_WIDTH
 # that table stops today, which is why the rule below cannot simply go wider.
 BAND_AUTO = 32
 BAND_MAX = st._PVQ_N if hasattr(st, "_PVQ_N") else WIDTH
+# A frame so cheap that its own fields would be the file gets the wider band instead. This is
+# measured rather than reasoned: moz.wav at 16 kbit/s reads 12.76 -> 13.71 dB for 2% more bytes,
+# and phone.wav at 6 kbit/s 3.93 -> 4.51 dB. At 24 kbit/s the two widths are a wash, 16.36 against
+# 16.34, which is why the threshold is allowed to sit below it: 32 is not worse there, it is the
+# same sound and less walking. And 64 kbit/s comes out 4.3 dB under the same 32, so the rule dies
+# somewhere under there. It is stated in bits per frame and not in kbit/s because that is the
+# currency the solve spends, which is also what makes it behave the same on a 44.1 kHz file: 853
+# b/f is 20 kbit/s at 48 kHz and 802 at 44.1.
+BAND_NARROW = 64
+BAND_NARROW_MAX_BPF = 853.0
 
 
 def read_wav(path):
@@ -436,10 +446,11 @@ def main():
     ap.set_defaults(fill_shape=None)
     ap.add_argument("--band-width", dest="band_width", choices=("auto", "16", "32", "64"),
                     default="auto",
-                    help="bins per scalefactor band. auto (default) is 32, which halves the "
-                         "scale and mask fields against 16 and spends the saving on coefficients"
-                         ", where it buys more than the frequency resolution it gives up. 16 is "
-                         "what every file before this had, for A/B against an old stream")
+                    help="bins per scalefactor band. auto (default) is 32, or 64 when the frame "
+                         "budget is so small the fields would be the file, which halves the scale "
+                         "and mask fields against 16 and spends the saving on coefficients, where "
+                         "it buys more than the frequency resolution it gives up. 16 is what every "
+                         "file before this had, for A/B against an old stream")
     ap.add_argument("--pvq", action="store_true",
                     help="each live band is one energy and a pyramid shape over all of "
                          "its bins. Dead bands stay fill or silence. Off unless asked")
@@ -467,19 +478,9 @@ def main():
     args = ap.parse_args()
     if args.fill_shape is None:
         args.fill_shape = args.fill
-    # The other half of the geometry, and it is already a header field, so the decoder takes
-    # whatever is written and no format decision is hiding here. See the rule at BAND_AUTO.
-    global WIDTH
-    if args.band_width == "auto":
-        WIDTH = BAND_AUTO
-    elif int(args.band_width) > BAND_MAX:
-        raise SystemExit(f"band width {args.band_width} is past what the pyramid tables hold "
-                         f"({BAND_MAX}); the encoder would write a file this decoder cannot read")
-    else:
-        WIDTH = int(args.band_width)
-    r3.BAND_WIDTH = WIDTH
     # One geometry for the whole file, chosen before the rate solve so the solve and the
-    # payload agree, and written to the header so the decoder reads what was written.
+    # payload agree, and written to the header so the decoder reads what was written. Band width
+    # belongs to that choice, and is taken below because its rule needs the sample rate.
     if args.shape_block == "auto":
         sblock = st.SHAPE_BLOCK_WIDE
     elif args.shape_block == "2":
@@ -492,6 +493,23 @@ def main():
     n_samp = x.shape[0]
     nfr = st.frame_count(n_samp, N2)
     dur = n_samp / sr
+    # The band width is the other half of that geometry, and it is already a header field, so the
+    # decoder takes what is written and no format decision is hiding in it. Asked for explicitly
+    # it is only checked; left to auto it is read off the frame budget, which is why it waits for
+    # the sample rate.
+    global WIDTH
+    if args.band_width != "auto":
+        if int(args.band_width) > BAND_MAX:
+            raise SystemExit(f"band width {args.band_width} is past what the pyramid tables hold "
+                             f"({BAND_MAX}); the encoder would write a file this decoder cannot "
+                             f"read")
+        WIDTH = int(args.band_width)
+    else:
+        bpf = args.budget if args.budget else args.bitrate * 1000.0 / (sr / (N2 // 2))
+        WIDTH = BAND_NARROW if bpf <= BAND_NARROW_MAX_BPF else BAND_AUTO
+        if WIDTH > BAND_MAX:
+            WIDTH = BAND_AUTO
+    r3.BAND_WIDTH = WIDTH
     out = args.output or (os.path.splitext(args.input)[0] + ".rsc3")
     print(f"RSC3 encode   {args.input}", flush=True)
     print(f"   {n_samp} samples  {dur:.2f}s  {sr} Hz  {nch}ch   {nfr} frames   "

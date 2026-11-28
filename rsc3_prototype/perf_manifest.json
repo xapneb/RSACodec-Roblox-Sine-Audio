@@ -7,10 +7,10 @@
    "--fill",
    "--ms"
   ],
-  "bytes": 39167,
+  "bytes": 37147,
   "frames": 960000,
-  "payload": "7e7baaa511901320",
-  "samples": "2447073a6cc74fc9",
+  "payload": "d03774d43c41fc3c",
+  "samples": "0d3c607033e9079d",
   "src": ".perf_cache/bench20.wav"
  },
  "b24pvq": {
@@ -61,10 +61,10 @@
    "--shape-block",
    "2"
   ],
-  "bytes": 22412,
+  "bytes": 21686,
   "frames": 882000,
-  "payload": "567882f3990420d4",
-  "samples": "8b519a6f1ebf01c2",
+  "payload": "d6a87a3b44778105",
+  "samples": "6c707540a6dcd7b0",
   "src": "sine.wav"
  },
  "s24pvq": {
