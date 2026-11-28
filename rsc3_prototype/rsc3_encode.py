@@ -434,7 +434,7 @@ def main():
     shape.add_argument("--no-fill-shape", dest="fill_shape", action="store_false",
                        help="leave dead high bands to the flat fill")
     ap.set_defaults(fill_shape=None)
-    ap.add_argument("--band-width", dest="band_width", choices=("auto", "16", "32"),
+    ap.add_argument("--band-width", dest="band_width", choices=("auto", "16", "32", "64"),
                     default="auto",
                     help="bins per scalefactor band. auto (default) is 32, which halves the "
                          "scale and mask fields against 16 and spends the saving on coefficients"

@@ -1329,7 +1329,13 @@ PVQ_K_TABLE = 256
 # deep and died in the decoder rather than in the encoder, which is the worst place for it, since
 # the encoder's own measure still said the file was good. The reach is therefore a capability the
 # tables have to hold, not a preference about what looks tidy.
-_PVQ_N = 32
+#
+# Building to 64 bins costs 3 ms of import and nothing else, so the width an encoder is allowed to
+# write is set by BAND_MAX in rsc3_encode, which reads this, rather than by what the tables happen
+# to hold. What a wider band does *not* get for free is speed: past 62 bits of index the compiled
+# walk stands aside and the reference walk answers, and an index that big arrives long before the
+# band does anything interesting.
+_PVQ_N = 64
 _PVQ_COUNT = {}
 
 
