@@ -1,12 +1,15 @@
-"""rsc3_bits.py - the bit grammar's one sequential step, compiled.
+"""rsc3_bits.py - the sequential parts of the codec, compiled.
 
 Everything else in the codec has been moved to numpy, where whole frames and whole bands go
-through in one call. A Rice field cannot go that way: a codeword's length depends on the value
-ahead of it, so the only way to know where the next symbol begins is to walk there. Read in
-Python that walk is about a microsecond a symbol, which on twenty seconds of audio is most of
-what the decoder does, and the per-symbol `quotient` call is also where the reservoir spends its
-time. This is that walk at machine speed over the payload's own bytes, with a cursor in and a
-cursor out.
+through in one call. Two things cannot go that way. A Rice field: a codeword's length depends on
+the value ahead of it, so the only way to know where the next symbol begins is to walk there.
+Read in Python that walk is about a microsecond a symbol, which on twenty seconds of audio is
+most of what the decoder does, and the per-symbol `quotient` call is also where the reservoir
+spends its time. And the pyramid placer: its vectorised form steps every band once per pulse so
+the bands that finished early are walked again with the ones still running, which on a 32-bin
+band at 27 pulses is mostly memory traffic over work already done. The compiled `pvq_place` is
+that loop per band; the rule, the order, and the tie-break are the same ones the numpy block
+still holds.
 
 The Python reader in `rsc3_stream` is still there and still correct, and it is what runs on a
 machine without the JIT. That is deliberate: a decoder that only works once something is
@@ -214,9 +217,58 @@ if HAVE_NUMBA:
                     p += 1
                 return out
 
+    @njit(cache=True, nogil=True, fastmath=False)
+    def pvq_place(x, kk):
+        """Place `kk[i]` pulses on band `i`, the way `_choose_bands`'s loop does.
+
+        The vectorised form runs the bands in lockstep, so every pulse costs a pass over
+        (bands x bins) for the score, the argmax and the four accumulators, and the bands that
+        stopped several pulses ago are walked again with the rest. A 32-bin band at 27 pulses
+        is about 131 thousand score evaluations, most of them memory traffic.
+
+        The arithmetic is the same, in the same order, so the doubles match: `score = (corr +
+        |x|)^2 / (ny + 2*ay + 1)` at every bin including the ones whose sample is zero, a
+        strict `>` so the earliest bin wins a tie as argmax does, and a band that chooses a
+        zero bin is done. `ny` takes `2*ay_before + 1` the way the original reads the count
+        before bumping it. Nothing else is decided here: energy, exponent and gain stay with
+        the numpy code that computes them, because the exponent wants the same log2 a vector
+        gives and that is not this loop's business.
+        """
+        nband, width = x.shape
+        y = np.zeros((nband, width), np.int64)
+        for i in range(nband):
+            k = kk[i]
+            if k <= 0:
+                continue
+            ay = np.zeros(width, np.int64)
+            ny = 0.0
+            corr = 0.0
+            for _ in range(k):
+                best = -1.0
+                bi = -1
+                best_ax = 0.0
+                for j in range(width):
+                    xv = x[i, j]
+                    ax = -xv if xv < 0.0 else xv
+                    den = ny + 2.0 * ay[j] + 1.0
+                    num = corr + ax
+                    s = (num * num) / den
+                    if s > best:
+                        best = s
+                        bi = j
+                        best_ax = ax
+                if bi < 0 or best_ax <= 0.0:
+                    break
+                y[i, bi] += 1 if x[i, bi] >= 0.0 else -1
+                ny += 2.0 * ay[bi] + 1.0
+                ay[bi] += 1
+                corr += best_ax
+        return y
+
 else:                                   # pragma: no cover - the path a box without the JIT takes
     # Everything here is the reader's own per-symbol walk, which is slower and correct.
     rice_decode = None
     gap_decode = None
     pvq_walk = None
     pvq_band = None
+    pvq_place = None

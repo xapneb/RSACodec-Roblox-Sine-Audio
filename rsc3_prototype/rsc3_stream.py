@@ -1673,7 +1673,10 @@ def _choose_bands(x, b, k_cap=0):
     One row is what `_choose_band` used to do alone: energy in bin order, then
     exactly K greedy pulses. The score is `(corr + |x|)^2 / (ny + 2*|y| + 1)`,
     and a tie keeps the earlier bin. Stacking the rows is the same arithmetic
-    per band, which is what makes a loud file's placement cheap.
+    per band, which is what makes a loud file's placement cheap. On a machine
+    with the JIT the pulses go through the compiled per-band form, which stops
+    walking a band once it is done; the block below is the same rule for every
+    other box, and `perf_check` is what says they agree.
     """
     x = np.asarray(x, np.float64)
     if x.ndim == 1:
@@ -1702,6 +1705,14 @@ def _choose_bands(x, b, k_cap=0):
         qq = np.clip(np.round(ratio), 0, lim.astype(np.float64)).astype(np.int64)
         q = np.where(good, qq, 0)
         kk = _k_vec(b, width, k_cap)
+        if _BITS.pvq_place is not None:
+            # One band at a time, so a band that stopped is not walked again. The rule and the
+            # arithmetic are the ones just below, in the same order, which is why perf_check can
+            # call it a byte-for-byte match rather than a close one.
+            y = _BITS.pvq_place(np.ascontiguousarray(x, np.float64),
+                                np.where(live, kk, 0).astype(np.int64))
+            y[np.abs(y).sum(axis=1) == 0, 0] = 1
+            return q, y, E
         ax = np.abs(x)
         # A silent bin has no direction. np.sign(0) is 0, which would plant a
         # later pulse with no sign, so a non-negative sample stays positive.
