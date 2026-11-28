@@ -72,7 +72,7 @@ def _mask_bits(ms):
 
 
 def _field_bits(A, sr, budget, A_db, thr, fill, shape, mode, pvq=False, ms=None,
-                sblock=st.SHAPE_BLOCK):
+                sblock=st.SHAPE_BLOCK, frame=0):
     """Bits write_frame will emit for these frames, plus the mid/side mask.
 
     With pyramids, the gain exponent is the band energy and the shape bits are
@@ -95,7 +95,7 @@ def _field_bits(A, sr, budget, A_db, thr, fill, shape, mode, pvq=False, ms=None,
         mant = np.zeros(A3.shape, np.int64)
         pvq_costs = st.pvq_model_costs(bits, WIDTH)
     else:
-        mant = st.quantise_bands(A3, E, bits)
+        mant = st.quantise_bands(A3, E, bits, frame=frame)
         pvq_costs = None
     fills = None
     shapes = None
@@ -141,7 +141,7 @@ def _sample_bpf(A, A_db, thr, sr, budget, fill, shape, mode, pvq=False, ms=None,
         w = min(win, A.shape[0] - s)
         bits += _field_bits(A[s:s + w], sr, budget, A_db[s:s + w], thr[s:s + w],
                             fill, shape, mode, pvq=pvq,
-                            ms=None if ms is None else ms[s:s + w], sblock=sblock)
+                            ms=None if ms is None else ms[s:s + w], sblock=sblock, frame=s)
         frames += w
     return bits / frames
 
@@ -464,6 +464,11 @@ def main():
     shape.add_argument("--no-fill-shape", dest="fill_shape", action="store_false",
                        help="leave dead high bands to the flat fill")
     ap.set_defaults(fill_shape=None)
+    ap.add_argument("--dither", dest="dither", type=float, default=0.0, metavar="LSB",
+                    help="add dither this many quantiser steps before rounding, so quiet bins "
+                         "inside a band land on noise instead of zero. Free at the decoder: the "
+                         "mantissa it reads already contains it. Costs a little noise floor; "
+                         "0 is the undithered quantiser and reproduces older files byte for byte")
     ap.add_argument("--fill-margin", dest="fill_margin", type=float, default=0.0, metavar="DB",
                     help="dB of mask the dead-band filler may spend above the quietest bin of "
                          "the band it fills. 0 is the strict ceiling, where one least-masked bin "
@@ -505,6 +510,7 @@ def main():
         args.fill_shape = args.fill
     global FILL_MARGIN
     FILL_MARGIN = args.fill_margin
+    st.DITHER = args.dither
     # One geometry for the whole file, chosen before the rate solve so the solve and the
     # payload agree, and written to the header so the decoder reads what was written. Band width
     # belongs to that choice, and is taken below because its rule needs the sample rate.

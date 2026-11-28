@@ -307,6 +307,22 @@ because an allocation that changes is a different codec and not a faster one:
   only because it hides under the ATH floor - which is exactly why the gate is the bit map
   and not the threshold.
 
+- **Dither is a dial on the quantiser, off by default, and it is not free.** `--dither LSB` adds
+  TPDF noise before the mantissa rounds. It is the one quantisation fix the format cannot notice:
+  the dithered number is what gets transmitted, so the decoder rebuilds it without being told. The
+  reason to have it at all is what `hf_birds.py` counts - a band-granular step rounds the quiet
+  bins inside a band down to zero and leaves the loud bin standing alone with thirty dB of nothing
+  around it, which is one cosine, not a spectrum - and at 1.0 LSB that count does drop, 2.32 to
+  1.59 isolated bins per frame on `moz.wav`. It also costs, on the same fixed budget: 25.69 to
+  28.13 kbit/s, and 14.39 to 9.86 dB of ES. That is not a bug, it is the shape of this codec: the
+  step is one value per band, so a bin sitting 50 dB below its band's peak pays a whole step of
+  dither to stop being zero. On quiet material it is worse, not better - `phone.wav` at the same
+  plane count goes 17.87 to 20.47 kbit/s and 9.29 to 5.80 dB. So the dial is there for the scalar
+  path, the default is 0, and 0 reproduces every file this codec has written.
+  It does nothing at all to the pyramid path, which is the shipped one: a pyramid band transmits
+  no mantissas, so there is nothing for it to touch, and the sparsity there is the representation,
+  not a rounding decision.
+
 - **The format and a Python decoder exist; the Luau one does not.** `rsc3_stream.py` is the
   grammar, `rsc3_decode.py` reads a file with no knowledge of the allocation model, and
   `test_roundtrip.py` proves the two CLIs cannot disagree. RSC2 v3 (`../rsc2_testing_lab`) is
