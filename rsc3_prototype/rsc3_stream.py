@@ -998,7 +998,7 @@ def run_fill_words(cap_db, b_band, mode="safe"):
     return out
 
 
-def band_fill_cap(A_band, thr_band=None):
+def band_fill_cap(A_band, thr_band=None, margin=0.0):
     """
     The ceiling a band may be filled to: its own energy, and no more than the quietest bin in it
     can hide. The second half is not decoration. A flat floor across a band is masked only if
@@ -1013,7 +1013,23 @@ def band_fill_cap(A_band, thr_band=None):
     lvl = 10.0 * np.log10(np.maximum((np.asarray(A_band) ** 2).mean(axis=-1), 10 ** FILL_FLOOR))
     if thr_band is None:
         return lvl
-    return np.minimum(lvl, np.maximum(np.min(np.asarray(thr_band), axis=-1), FILL_FLOOR))
+    floor = np.maximum(np.min(np.asarray(thr_band), axis=-1), FILL_FLOOR)
+    return np.minimum(lvl, floor + float(margin))
+
+
+def shape_level_cap(A_band, thr_band, b_band, margin=0.0):
+    """What the shape field may paint: a live band keeps its own energy, a dead band takes the
+    mask ceiling instead. The distinction is not pedantry. `shape_window` measures the frame's
+    loudness off the same array it paints from, so capping every band would drag the frame peak
+    down with it and then tell itself the frame had no treble to fill - which reads as a quieter
+    file, not a safer one, and costs coverage for no legality. Dead bands are the only place a
+    shape word is ever written, so that is the only place a ceiling has to be.
+    """
+    lvl = band_fill_cap(A_band, None)
+    if thr_band is None:
+        return lvl
+    dead = np.asarray(b_band) <= 0
+    return np.where(dead, np.minimum(lvl, band_fill_cap(A_band, thr_band, margin)), lvl)
 
 
 def shape_reg(sr, n2, width):

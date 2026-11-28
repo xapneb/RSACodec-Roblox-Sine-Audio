@@ -150,7 +150,46 @@ trick that costs side info is charged **inside** the budget or the comparison do
   can be exposed by temporal masking the model does not have. If the fill ever sounds wrong,
   that is the failure mode to look for, not the mean.
 
-- **A shaped fill rides on top of the flat word above 14 kHz, as an option.** The flat word has a
+- **The shape field used to be exempt from the mask ceiling, and that is what the filler actually
+  sounded like.** `--fill` turns the shape field on (`args.fill_shape` defaults to `args.fill`), so
+  the flat mask-levelled word is not what ships on its own: most of the dead bands a listener hears
+  were being filled by the shape word, whose level was the band's *own energy* with no ceiling at
+  all, on the theory that a dead band's energy is what the frame is already masking.
+  `fill_audit.py` asks the file, on `moz.wav` at 24 kbit/s, one channel:
+
+  | arm | dead bands that get noise | filled bins over their own mask | worst over |
+  |-----|--------------------------:|--------------------------------:|-----------:|
+  | flat word only, `--no-fill-shape` | 3.7% | 0 | 0 dB |
+  | shape field, uncapped - what shipped | 54.4% | **35.9%** | **+40.0 dB** |
+  | shape field, capped at the mask | 8.0% | 0 | 0 dB |
+  | capped + `--fill-margin 8` | 15.0% | 5.4% | +7.6 dB |
+  | capped + `--fill-margin 14` | 32.5% | 15.7% | +13.3 dB |
+
+  The middle row is the number to be worried about, because 35% of filled bins above the mask and
+  the worst of them by 40 dB is the same shape of failure that retired the `mean` arm above. It was
+  not a tuning miss either: the shape field simply never asked for the mask, while the run law had
+  been asking for it all along. `shape_level_cap` now buys the dead bands the same ceiling and
+  leaves the live ones at their own energy, which matters because `shape_window` measures the
+  frame's loudness off the same array it paints from - ceiling everything pulls the frame peak
+  down with it, and then talks itself out of filling anything at all.
+
+  **`--fill-margin DB` is the dial, and it is bounded by arithmetic, not by a calibration.** The
+  level a dead band is filled to is `min(its own energy, its quietest bin's threshold + margin)`,
+  so no bin in the file can sit more than `margin` dB over the mask that was supposed to hide it,
+  whatever the material does. The sweep above is that claim being measured rather than asserted.
+  The default is 0, which puts the contract back to zero bins over mask. It costs coverage, and
+  the reason is worth knowing: a 32-bin band is 375 Hz of spectrum, and the strict rule lets one
+  least-masked bin inside that band set the floor for all thirty-two. At 16-bin geometry that was
+  half as blunt, which is the part of the band-width change nobody re-checked against the filler.
+
+  Nothing about the grammar moved: same fields, same widths, no header flag, so a file encoded
+  before this decodes exactly as it did. `perf_manifest.json` was re-blessed because the *values*
+  of the shape words moved, and the payloads moved with them - 37,147 to 33,295 bytes at 8 kbit/s,
+  where the fill field is now delta-coded from quieter levels. `fill_audit.py` is the tool that
+  prints this table for any file and rate.
+
+- **A shaped fill rides on top of the flat word, and it is on whenever `--fill` is on.** The flat
+  word has a
   geometric problem, not a tuning one. A dead run on this material is routinely ~120 bands wide -
   one frame of `cam15` has a single run spanning 1.2 to 23.9 kHz - and one level plus one *straight*
   slope has to follow a mask curve that is not straight. `_ceiling_probe.py` measures the result by

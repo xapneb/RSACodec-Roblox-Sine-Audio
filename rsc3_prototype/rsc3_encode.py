@@ -26,6 +26,16 @@ import rsc3_progress as prog
 import rsc3_stream as st
 
 N2 = 4096
+# How much mask the dead-band filler is allowed to spend above the quietest bin of the band it
+# fills. 0 is the strict ceiling, where the whole band is pinned by its single least masked bin;
+# on a 32-bin band that bin is one sample of a 375 Hz range, and it was costing most of the
+# coverage the filler exists to provide. The number is not a guess about audibility: because the
+# level is capped by min threshold + margin, no bin in the file can sit more than `margin` dB
+# above the mask that was supposed to hide it, whatever the material does. Measure with
+# fill_audit.py, which reports coverage, the share of bins over mask, and that worst case.
+FILL_MARGIN = 0.0
+
+
 WIDTH = r3.BAND_WIDTH
 # The band width `auto` picks, and the widest one this codec can write. The second is a hard
 # limit, not a preference: a pyramid shape is written over a whole band, and the count table only
@@ -89,13 +99,18 @@ def _field_bits(A, sr, budget, A_db, thr, fill, shape, mode, pvq=False, ms=None,
         pvq_costs = None
     fills = None
     shapes = None
+    # Same rule encode_channel uses for needing a mask: the run law wants it, and so does the
+    # shape word's ceiling, and only when a field is actually being written. Where either side
+    # got a mask the other did not, the drift check would be the only thing left telling the
+    # truth, and it only reports a number, not which field forgot to ask.
+    need_thr = (fill and mode == "safe") or (fill and shape)
+    cap_thr = thr.reshape(nfr, nb, WIDTH) if (need_thr and thr is not None) else None
     if fill:
-        cap_thr = thr.reshape(nfr, nb, WIDTH) if mode == "safe" else None
-        caps = st.band_fill_cap(A3, cap_thr)
+        caps = st.band_fill_cap(A3, cap_thr if mode == "safe" else None, FILL_MARGIN)
         fills = st.run_fill_words_all(caps, bits, mode)
     if shape:
         reg = st.shape_reg(sr, nc * 2, WIDTH)
-        energy = st.band_fill_cap(A3, None)
+        energy = st.shape_level_cap(A3, cap_thr, bits, FILL_MARGIN)
         shapes = st.shape_window(energy, bits, reg, sblock)
     return int(st.frame_costs(E, bits, mant, WIDTH, fill_levels=fills,
                               shape_fields=shapes, pvq_costs=pvq_costs).sum()) + _mask_bits(ms)
@@ -326,16 +341,20 @@ def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe
             raise ValueError(f"mid/side mask is {ms.shape}, expected {(nfr, nb)}")
     # The fill ceiling is a masking question, and the allocation already knows the mask, so
     # taking the same threshold here is not extra theory - it is the same number, asked for.
-    # "mean" fill does not need it, and getting it anyway would cost a mask per frame for
-    # nothing. The shape field does not use it either: its level is the band's own energy,
-    # because a mask ceiling on an unmasked band is silence.
-    need_thr = fill and mode == "safe"
+    # "mean" fill does not need the run ceiling and getting it anyway would cost a mask per
+    # frame for nothing. The shape field does need it: a shape word is the band's own energy,
+    # and a band that was given no bits is precisely a band whose energy it could not hide.
+    # Uncapped, that is not a small slip - measured through the real files, the shape field put
+    # three bins in five above the mask it was filling, and the worst of them by 40 dB. See
+    # fill_audit.py, which is what that sentence is standing on.
+    need_thr = (fill and mode == "safe") or (fill and shape)
+    run_cap = fill and mode == "safe"
     if A_db is None and (need_thr or thr is not None):
         A_db = 20.0 * np.log10(np.maximum(np.abs(A), 1e-30))
     if need_thr and thr is None:
         thr = r3.threshold_dbfs(A_db, sr, nc, psycho=psycho)
     bits = band_bits(A, sr, budget, psycho, A_db=A_db,
-                     thr=thr if (pvq or need_thr or thr is not None) else None,
+                     thr=thr if (pvq or run_cap or thr is not None) else None,
                      pvq=pvq)
     A3 = A.reshape(nfr, nb, WIDTH)
     E_all = st.band_exponents(A3)
@@ -352,8 +371,9 @@ def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe
         recs_all = None
         pulses_all = None
     thr3 = thr.reshape(nfr, nb, WIDTH) if need_thr else None
-    caps = st.band_fill_cap(A3, thr3) if fill else None
-    energy = st.band_fill_cap(A3, None) if shape else None
+    caps = st.band_fill_cap(A3, thr3 if mode == "safe" else None,
+                            FILL_MARGIN) if fill else None
+    energy = st.shape_level_cap(A3, thr3, bits, FILL_MARGIN) if shape else None
     reg = st.shape_reg(sr, 2 * nc, WIDTH) if shape else None
     shapes = st.shape_window(energy, bits, reg, sblock) if shape else None
     # The fill words are a pure function of this frame's dead runs and its own ceilings, so
@@ -444,6 +464,11 @@ def main():
     shape.add_argument("--no-fill-shape", dest="fill_shape", action="store_false",
                        help="leave dead high bands to the flat fill")
     ap.set_defaults(fill_shape=None)
+    ap.add_argument("--fill-margin", dest="fill_margin", type=float, default=0.0, metavar="DB",
+                    help="dB of mask the dead-band filler may spend above the quietest bin of "
+                         "the band it fills. 0 is the strict ceiling, where one least-masked bin "
+                         "pins the whole band; 6 to 12 buys back coverage and can never leave a "
+                         "bin more than that far over its mask")
     ap.add_argument("--band-width", dest="band_width",
                     default="auto",
                     help="bins per scalefactor band. auto (default) is 32, or 64 when the frame "
@@ -478,6 +503,8 @@ def main():
     args = ap.parse_args()
     if args.fill_shape is None:
         args.fill_shape = args.fill
+    global FILL_MARGIN
+    FILL_MARGIN = args.fill_margin
     # One geometry for the whole file, chosen before the rate solve so the solve and the
     # payload agree, and written to the header so the decoder reads what was written. Band width
     # belongs to that choice, and is taken below because its rule needs the sample rate.

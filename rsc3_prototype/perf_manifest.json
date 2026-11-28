@@ -7,10 +7,10 @@
    "--fill",
    "--ms"
   ],
-  "bytes": 37147,
+  "bytes": 33295,
   "frames": 960000,
-  "payload": "d03774d43c41fc3c",
-  "samples": "0d3c607033e9079d",
+  "payload": "de1cdfe5d5f04e42",
+  "samples": "1632a76b0c3b8787",
   "src": ".perf_cache/bench20.wav"
  },
  "b24pvq": {
@@ -21,10 +21,10 @@
    "--fill",
    "--ms"
   ],
-  "bytes": 117768,
+  "bytes": 117289,
   "frames": 960000,
-  "payload": "a493565e4818788b",
-  "samples": "795cf2543b0c1e80",
+  "payload": "f0231d2ef9c5b8e6",
+  "samples": "ad5708fa5436c3b3",
   "src": ".perf_cache/bench20.wav"
  },
  "b24sc": {
@@ -33,10 +33,10 @@
    "24",
    "--fill"
   ],
-  "bytes": 120956,
+  "bytes": 121306,
   "frames": 960000,
-  "payload": "1494db9403aecb43",
-  "samples": "f64390f39584f2bb",
+  "payload": "6713efc0c460c38d",
+  "samples": "d5c82fb57ff7cee1",
   "src": ".perf_cache/bench20.wav"
  },
  "b64pvq": {
@@ -47,10 +47,10 @@
    "--fill",
    "--ms"
   ],
-  "bytes": 318406,
+  "bytes": 320792,
   "frames": 960000,
-  "payload": "e583b8d285101ec5",
-  "samples": "6cf28c12bac0305b",
+  "payload": "d5b01b98d37eb8fa",
+  "samples": "cb16283c7fd26ef2",
   "src": ".perf_cache/bench20.wav"
  },
  "s10fine": {
@@ -61,10 +61,10 @@
    "--shape-block",
    "2"
   ],
-  "bytes": 21686,
+  "bytes": 21683,
   "frames": 882000,
-  "payload": "d6a87a3b44778105",
-  "samples": "6c707540a6dcd7b0",
+  "payload": "70fc45e206a25867",
+  "samples": "e7e2206bde0f9a0a",
   "src": "sine.wav"
  },
  "s24pvq": {
@@ -75,10 +75,10 @@
    "--fill",
    "--ms"
   ],
-  "bytes": 58786,
+  "bytes": 58778,
   "frames": 882000,
-  "payload": "8af130e90385e205",
-  "samples": "4bf668920e2f5dd4",
+  "payload": "7ec83bdb8538fc33",
+  "samples": "275fc05f64ae59da",
   "src": "sine.wav"
  }
 }
