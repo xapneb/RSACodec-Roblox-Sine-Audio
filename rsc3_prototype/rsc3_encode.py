@@ -444,7 +444,7 @@ def main():
     shape.add_argument("--no-fill-shape", dest="fill_shape", action="store_false",
                        help="leave dead high bands to the flat fill")
     ap.set_defaults(fill_shape=None)
-    ap.add_argument("--band-width", dest="band_width", choices=("auto", "16", "32", "64"),
+    ap.add_argument("--band-width", dest="band_width",
                     default="auto",
                     help="bins per scalefactor band. auto (default) is 32, or 64 when the frame "
                          "budget is so small the fields would be the file, which halves the scale "
@@ -499,11 +499,21 @@ def main():
     # the sample rate.
     global WIDTH
     if args.band_width != "auto":
-        if int(args.band_width) > BAND_MAX:
-            raise SystemExit(f"band width {args.band_width} is past what the pyramid tables hold "
-                             f"({BAND_MAX}); the encoder would write a file this decoder cannot "
-                             f"read")
-        WIDTH = int(args.band_width)
+        w = int(args.band_width)
+        if w < 1 or w > BAND_MAX:
+            raise SystemExit(f"band width {w} is not between 1 and {BAND_MAX} bins, which is all "
+                             f"the pyramid tables can name. The encoder would otherwise write a "
+                             f"file whose shape field has no codebook")
+        if (N2 // 2) % w:
+            # A band is a slice of the coefficient row, so the grid has to divide it. This is the
+            # reason the fitted optimum and the width actually used are different numbers: the
+            # quality surface wants 25 bins at 64 kbit/s and 42 at 24 kbit/s, and 2048 = 2**11
+            # coefficients divide only into powers of two, so the curve is sampled at the nearest
+            # point it permits rather than followed. Measured, that costs 0.1 to 0.3 dB, which is
+            # why nobody has rebuilt the grid to take an uneven last band.
+            raise SystemExit(f"band width {w} does not divide {N2 // 2} coefficients into whole "
+                             f"bands; this geometry takes widths that divide evenly")
+        WIDTH = w
     else:
         bpf = args.budget if args.budget else args.bitrate * 1000.0 / (sr / (N2 // 2))
         WIDTH = BAND_NARROW if bpf <= BAND_NARROW_MAX_BPF else BAND_AUTO
