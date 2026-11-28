@@ -1,0 +1,84 @@
+{
+ "b08pvq": {
+  "args": [
+   "--bitrate",
+   "8",
+   "--pvq",
+   "--fill",
+   "--ms"
+  ],
+  "bytes": 39167,
+  "frames": 960000,
+  "payload": "7e7baaa511901320",
+  "samples": "2447073a6cc74fc9",
+  "src": ".perf_cache/bench20.wav"
+ },
+ "b24pvq": {
+  "args": [
+   "--bitrate",
+   "24",
+   "--pvq",
+   "--fill",
+   "--ms"
+  ],
+  "bytes": 117768,
+  "frames": 960000,
+  "payload": "a493565e4818788b",
+  "samples": "795cf2543b0c1e80",
+  "src": ".perf_cache/bench20.wav"
+ },
+ "b24sc": {
+  "args": [
+   "--bitrate",
+   "24",
+   "--fill"
+  ],
+  "bytes": 120956,
+  "frames": 960000,
+  "payload": "1494db9403aecb43",
+  "samples": "f64390f39584f2bb",
+  "src": ".perf_cache/bench20.wav"
+ },
+ "b64pvq": {
+  "args": [
+   "--bitrate",
+   "64",
+   "--pvq",
+   "--fill",
+   "--ms"
+  ],
+  "bytes": 318406,
+  "frames": 960000,
+  "payload": "e583b8d285101ec5",
+  "samples": "6cf28c12bac0305b",
+  "src": ".perf_cache/bench20.wav"
+ },
+ "s10fine": {
+  "args": [
+   "--bitrate",
+   "10",
+   "--fill",
+   "--shape-block",
+   "2"
+  ],
+  "bytes": 22412,
+  "frames": 882000,
+  "payload": "567882f3990420d4",
+  "samples": "8b519a6f1ebf01c2",
+  "src": "sine.wav"
+ },
+ "s24pvq": {
+  "args": [
+   "--bitrate",
+   "24",
+   "--pvq",
+   "--fill",
+   "--ms"
+  ],
+  "bytes": 58786,
+  "frames": 882000,
+  "payload": "8af130e90385e205",
+  "samples": "4bf668920e2f5dd4",
+  "src": "sine.wav"
+ }
+}

@@ -83,7 +83,8 @@ rsc3_prototype/            后继版本，所有度量都从这里跑
 ├── rsc3_progress.py       终端进度条
 ├── test_stream.py         语法回归；缺 rsc2_testing_lab fixture 时打 SKIP 而不是崩
 ├── test_roundtrip.py      encode -> file -> decode 的端到端一致性
-├── perf_check.py          六个配置：payload 逐字节 + 解码样音逐样本地比
+├── perf_check.py          六个配置：payload + 解码样音的哈希基线（perf_manifest.json，跟着仓库走）
+├── perf_manifest.json     基线本身；--bless 生成，改了 bit 语法就会在这一行里显示出来
 ├── rate_curve.py / audible_sweep.py / hf_audit.py / gainfit_es.py    度量工具
 ├── ab_codec.py / _make_listening.py / _listen_shape.py               听音对照产物生成
 ├── transform_check.py     变换正确性
@@ -117,7 +118,9 @@ rsc2_testing_lab/          对照实验与 RSC2 参考实现
 
 - 🚫 禁止改 `_ref_codec.py` / `_ref_stream.py`。它们是被钉住的旧语法，唯一作用是让
   "byte-identical / sound-identical"这种话有意义。改了就等于把"优化"变成"新 codec"
-- 🚫 禁止在没有 `perf_check.py` 干净通过前把性能改动算数。先 `--bless` 建基线，再改，再比
+- 🚫 禁止在没有 `perf_check.py` 干净通过前把性能改动算数。先 `--bless` 建基线，再改，再比；
+  bless 只能在**你相信是对的**那棵树上做（基线现在是仓库里的 `perf_manifest.json`，
+  不再放 `/tmp`，重启不会把证据弄丢）；改到语法时先确认基线来自上一个好提交
 - 🚫 禁止在没记录 header 变更的情况下改 bitstream 语义。语法变了 header 必须能表达出来，
   否则老文件会被解码成 desync；漂移检查救不了你（它只抓账不平，不抓读错）
 - 🚫 禁止把一个花钱买 side info 的技巧算成"免费的"——README 的原话是这类开销必须记在
