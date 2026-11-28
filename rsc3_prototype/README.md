@@ -161,9 +161,9 @@ trick that costs side info is charged **inside** the budget or the comparison do
   |-----|--------------------------:|--------------------------------:|-----------:|
   | flat word only, `--no-fill-shape` | 3.7% | 0 | 0 dB |
   | shape field, uncapped - what shipped | 54.4% | **35.9%** | **+40.0 dB** |
-  | shape field, capped at the mask | 8.0% | 0 | 0 dB |
-  | capped + `--fill-margin 8` | 15.0% | 5.4% | +7.6 dB |
-  | capped + `--fill-margin 14` | 32.5% | 15.7% | +13.3 dB |
+  | shape field, capped - what ships | 8.0% | 0 | 0 dB |
+  | capped, with a 8 dB allowance | 15.0% | 5.4% | +7.6 dB |
+  | capped, with a 14 dB allowance | 32.5% | 15.7% | +13.3 dB |
 
   The middle row is the number to be worried about, because 35% of filled bins above the mask and
   the worst of them by 40 dB is the same shape of failure that retired the `mean` arm above. It was
@@ -173,14 +173,16 @@ trick that costs side info is charged **inside** the budget or the comparison do
   frame's loudness off the same array it paints from - ceiling everything pulls the frame peak
   down with it, and then talks itself out of filling anything at all.
 
-  **`--fill-margin DB` is the dial, and it is bounded by arithmetic, not by a calibration.** The
-  level a dead band is filled to is `min(its own energy, its quietest bin's threshold + margin)`,
-  so no bin in the file can sit more than `margin` dB over the mask that was supposed to hide it,
-  whatever the material does. The sweep above is that claim being measured rather than asserted.
-  The default is 0, which puts the contract back to zero bins over mask. It costs coverage, and
-  the reason is worth knowing: a 32-bin band is 375 Hz of spectrum, and the strict rule lets one
-  least-masked bin inside that band set the floor for all thirty-two. At 16-bin geometry that was
-  half as blunt, which is the part of the band-width change nobody re-checked against the filler.
+  **The last two rows were tried, and they are not in the codec.** Filling to
+  `min(its own energy, its quietest bin's threshold + allowance)` was worth measuring, because the
+  bound is arithmetic rather than a calibration: no bin anywhere in the file can then sit more
+  than `allowance` dB over the mask that was supposed to hide it, whatever the material does. The
+  sweep is what that buys and what it costs, so the decision is a known one instead of something
+  to rediscover: 8 dB doubles coverage for 5.4% of filled bins sitting at most 7.6 dB over, and
+  the codec ships the strict 0. Why it needs an allowance at all is worth keeping too: a 32-bin
+  band is 375 Hz of spectrum, and the strict rule lets one least-masked bin inside that band set
+  the floor for the other thirty-one. At 16-bin geometry that was half as blunt, which is the part
+  of the band-width change nobody re-checked against the filler.
 
   Nothing about the grammar moved: same fields, same widths, no header flag, so a file encoded
   before this decodes exactly as it did. `perf_manifest.json` was re-blessed because the *values*
@@ -307,21 +309,22 @@ because an allocation that changes is a different codec and not a faster one:
   only because it hides under the ATH floor - which is exactly why the gate is the bit map
   and not the threshold.
 
-- **Dither is a dial on the quantiser, off by default, and it is not free.** `--dither LSB` adds
-  TPDF noise before the mantissa rounds. It is the one quantisation fix the format cannot notice:
-  the dithered number is what gets transmitted, so the decoder rebuilds it without being told. The
-  reason to have it at all is what `hf_birds.py` counts - a band-granular step rounds the quiet
-  bins inside a band down to zero and leaves the loud bin standing alone with thirty dB of nothing
-  around it, which is one cosine, not a spectrum - and at 1.0 LSB that count does drop, 2.32 to
-  1.59 isolated bins per frame on `moz.wav`. It also costs, on the same fixed budget: 25.69 to
-  28.13 kbit/s, and 14.39 to 9.86 dB of ES. That is not a bug, it is the shape of this codec: the
-  step is one value per band, so a bin sitting 50 dB below its band's peak pays a whole step of
-  dither to stop being zero. On quiet material it is worse, not better - `phone.wav` at the same
-  plane count goes 17.87 to 20.47 kbit/s and 9.29 to 5.80 dB. So the dial is there for the scalar
-  path, the default is 0, and 0 reproduces every file this codec has written.
-  It does nothing at all to the pyramid path, which is the shipped one: a pyramid band transmits
-  no mantissas, so there is nothing for it to touch, and the sparsity there is the representation,
-  not a rounding decision.
+- **Dither was measured, and it is not in the codec.** It is the one quantisation fix the format
+  cannot notice, because the dithered number is what gets transmitted and the decoder rebuilds it
+  without being told - so implementing it cost nothing in syntax. The reason to try it is what
+  `hf_birds.py` counts: a band-granular step rounds the quiet bins inside a band down to zero and
+  leaves the loud bin standing alone with thirty dB of nothing around it, which is one cosine and
+  not a spectrum. At 1.0 LSB TPDF that count does drop, 2.32 to 1.59 isolated bins per frame on
+  `moz.wav`, so the mechanism works exactly as the theory says it should. What it costs, at the
+  same plane count so no rate search can hide it, is 25.69 to 28.13 kbit/s and 14.39 to 9.86 dB.
+  Not a bug, the shape of this codec: the step is one value per band, so a bin fifty dB below its
+  band's peak pays a whole step of noise to stop being zero, and a bin that lands on a step instead
+  of zero also costs more to entropy-code, which is where the rate comes from. On quiet material
+  it is worse rather than less good - `phone.wav` at the same budget goes 17.87 to 20.47 kbit/s and
+  9.29 to 5.80 dB. And it does nothing to the pyramid path, which is the shipped one, because a
+  pyramid band transmits no mantissas: there is no rounding for it to touch, and the sparsity there
+  is the representation rather than a decision. That last part is the reason it was removed rather
+  than left on a dial, and it is also where the remaining birdies live.
 
 - **The format and a Python decoder exist; the Luau one does not.** `rsc3_stream.py` is the
   grammar, `rsc3_decode.py` reads a file with no knowledge of the allocation model, and

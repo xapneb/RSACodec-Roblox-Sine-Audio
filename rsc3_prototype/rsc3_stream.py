@@ -145,42 +145,6 @@ SHAPE_DEPTH_OFF = 66.0
 # most of everything above ~7 kHz, which is the hole this pays for. The decoder already knows
 # exactly which bands are dead from b, so the run structure costs nothing: one 6-bit level per
 # run is the whole of the side info, and code 0 means leave that run silent.
-# Dither, in steps of the quantiser's own least bit. It goes in before rounding and nowhere
-# else: the mantissa that comes out is what gets transmitted, so the decoder rebuilds the same
-# number without being told anything about it. That is the whole reason this is worth two lines
-# rather than a syntax argument - dither is the only quantisation fix the format cannot notice.
-#
-# What it is for: band-granular steps. The step is one value for a whole band, so the quiet bins
-# inside it land on zero and only the loud bin survives, and a surviving bin with neighbours
-# thirty dB down is not a spectrum, it is one cosine - counted at +4.2 extra isolated bins per
-# frame against the source, by hf_birds.py. Raising everything off zero by half a bit turns that
-# back into noise, which is what the error should have been in the first place.
-#
-# It costs a little of the noise floor in exchange, so it is a dial and not a default. 0 leaves
-# every file this codec has ever written exactly as it is.
-DITHER = 0.0
-
-
-def dither_draw(nfr, nb, width, frame=0):
-    """TPDF dither in LSB units, (frames, bands, bins). Two uniforms per bin, triangle by
-    construction, and seeded per (frame, band, bin) so the draw changes every frame - a draw that
-    was constant over time would put a steady error offset on each bin, which is a tone again and
-    the opposite of the point. Same mixer as the noise fill, so it is portable, stateless and
-    reproducible, and a re-encode writes the same file.
-    """
-    if DITHER == 0.0:
-        return 0.0
-    f = (np.arange(nfr, dtype=np.int64) + int(frame))[:, None, None]
-    j = np.arange(nb, dtype=np.int64)[None, :, None]
-    i = np.arange(width, dtype=np.int64)[None, None, :]
-    x = (f * np.int64(0x9E3779B9) + j * np.int64(0x85EBCA6B)
-         + i * np.int64(0x9E3779B1)) & _HASH
-    x = ((x ^ (x >> np.int64(16))) * np.int64(0x85EBCA6B)) & _HASH
-    x = ((x ^ (x >> np.int64(13))) * np.int64(0xC2B2AE35)) & _HASH
-    u = (x ^ (x >> np.int64(16))).astype(np.float64) / 2.0 ** 31 - 1.0
-    return float(DITHER) * (0.5 * u + 0.5 * np.roll(u, 1, axis=-1))
-
-
 FILL_BITS = 6
 FILL_FLOOR = -120.0
 # The grid one level word sits on, and the largest word. fill_code is a scalar on this grid
@@ -622,32 +586,15 @@ def band_steps(E_band, b_band):
     return np.where(b_band > 0, step, 1.0)
 
 
-def dither_like(shape, frame=0):
-    """`dither_draw` for an array of any rank: a stack of frames is (frames, bands, bins) and one
-    frame is (bands, bins), and both callers exist - the encoder quantises the stack and the
-    grammar tests quantise one frame at a time. Rank 2 draws one frame, then drops that axis."""
-    if DITHER == 0.0:
-        return 0.0
-    if len(shape) == 2:
-        return dither_draw(1, shape[0], shape[1], frame)[0]
-    return dither_draw(shape[0], shape[1], shape[2], frame)
-
-
-def quantise_bands(A_band, E_band, b_band, frame=0):
+def quantise_bands(A_band, E_band, b_band):
     """
     Mantissas on the decoder's own grid, clamped to what the field holds: b magnitude bits
     reach 2**b - 1, and a bin sitting exactly on a power of two rounds onto 2**b. Clamping
     costs that bin one step of its own value, and keeps the field fixed width, which is
     better than spending an extra bit per bin on every band.
-
-    `frame` is the index of the first frame in the stack, which is not always zero: the rate
-    solve measures windows. The draw has to know, or the same frame gets a different dither
-    depending on which window it was measured inside, and then the model and the writer disagree
-    about numbers they both think they quantised.
     """
     step = band_steps(E_band, b_band)
-    d = dither_like(A_band.shape, frame)
-    m = np.round(A_band / step[..., None] + d)
+    m = np.round(A_band / step[..., None])
     lim = np.where(b_band > 0, (1 << np.maximum(b_band, 1)) - 1, 0)
     m = np.clip(m, -lim[..., None].astype(np.float64), lim[..., None].astype(np.float64))
     return np.where(b_band[..., None] > 0, m, 0.0).astype(np.int64)
@@ -1051,7 +998,7 @@ def run_fill_words(cap_db, b_band, mode="safe"):
     return out
 
 
-def band_fill_cap(A_band, thr_band=None, margin=0.0):
+def band_fill_cap(A_band, thr_band=None):
     """
     The ceiling a band may be filled to: its own energy, and no more than the quietest bin in it
     can hide. The second half is not decoration. A flat floor across a band is masked only if
@@ -1067,10 +1014,10 @@ def band_fill_cap(A_band, thr_band=None, margin=0.0):
     if thr_band is None:
         return lvl
     floor = np.maximum(np.min(np.asarray(thr_band), axis=-1), FILL_FLOOR)
-    return np.minimum(lvl, floor + float(margin))
+    return np.minimum(lvl, floor)
 
 
-def shape_level_cap(A_band, thr_band, b_band, margin=0.0):
+def shape_level_cap(A_band, thr_band, b_band):
     """What the shape field may paint: a live band keeps its own energy, a dead band takes the
     mask ceiling instead. The distinction is not pedantry. `shape_window` measures the frame's
     loudness off the same array it paints from, so capping every band would drag the frame peak
@@ -1082,7 +1029,7 @@ def shape_level_cap(A_band, thr_band, b_band, margin=0.0):
     if thr_band is None:
         return lvl
     dead = np.asarray(b_band) <= 0
-    return np.where(dead, np.minimum(lvl, band_fill_cap(A_band, thr_band, margin)), lvl)
+    return np.where(dead, np.minimum(lvl, band_fill_cap(A_band, thr_band)), lvl)
 
 
 def shape_reg(sr, n2, width):

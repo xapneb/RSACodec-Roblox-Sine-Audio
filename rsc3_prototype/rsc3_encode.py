@@ -26,16 +26,6 @@ import rsc3_progress as prog
 import rsc3_stream as st
 
 N2 = 4096
-# How much mask the dead-band filler is allowed to spend above the quietest bin of the band it
-# fills. 0 is the strict ceiling, where the whole band is pinned by its single least masked bin;
-# on a 32-bin band that bin is one sample of a 375 Hz range, and it was costing most of the
-# coverage the filler exists to provide. The number is not a guess about audibility: because the
-# level is capped by min threshold + margin, no bin in the file can sit more than `margin` dB
-# above the mask that was supposed to hide it, whatever the material does. Measure with
-# fill_audit.py, which reports coverage, the share of bins over mask, and that worst case.
-FILL_MARGIN = 0.0
-
-
 WIDTH = r3.BAND_WIDTH
 # The band width `auto` picks, and the widest one this codec can write. The second is a hard
 # limit, not a preference: a pyramid shape is written over a whole band, and the count table only
@@ -72,7 +62,7 @@ def _mask_bits(ms):
 
 
 def _field_bits(A, sr, budget, A_db, thr, fill, shape, mode, pvq=False, ms=None,
-                sblock=st.SHAPE_BLOCK, frame=0):
+                sblock=st.SHAPE_BLOCK):
     """Bits write_frame will emit for these frames, plus the mid/side mask.
 
     With pyramids, the gain exponent is the band energy and the shape bits are
@@ -95,7 +85,7 @@ def _field_bits(A, sr, budget, A_db, thr, fill, shape, mode, pvq=False, ms=None,
         mant = np.zeros(A3.shape, np.int64)
         pvq_costs = st.pvq_model_costs(bits, WIDTH)
     else:
-        mant = st.quantise_bands(A3, E, bits, frame=frame)
+        mant = st.quantise_bands(A3, E, bits)
         pvq_costs = None
     fills = None
     shapes = None
@@ -106,11 +96,11 @@ def _field_bits(A, sr, budget, A_db, thr, fill, shape, mode, pvq=False, ms=None,
     need_thr = (fill and mode == "safe") or (fill and shape)
     cap_thr = thr.reshape(nfr, nb, WIDTH) if (need_thr and thr is not None) else None
     if fill:
-        caps = st.band_fill_cap(A3, cap_thr if mode == "safe" else None, FILL_MARGIN)
+        caps = st.band_fill_cap(A3, cap_thr if mode == "safe" else None)
         fills = st.run_fill_words_all(caps, bits, mode)
     if shape:
         reg = st.shape_reg(sr, nc * 2, WIDTH)
-        energy = st.shape_level_cap(A3, cap_thr, bits, FILL_MARGIN)
+        energy = st.shape_level_cap(A3, cap_thr, bits)
         shapes = st.shape_window(energy, bits, reg, sblock)
     return int(st.frame_costs(E, bits, mant, WIDTH, fill_levels=fills,
                               shape_fields=shapes, pvq_costs=pvq_costs).sum()) + _mask_bits(ms)
@@ -141,7 +131,7 @@ def _sample_bpf(A, A_db, thr, sr, budget, fill, shape, mode, pvq=False, ms=None,
         w = min(win, A.shape[0] - s)
         bits += _field_bits(A[s:s + w], sr, budget, A_db[s:s + w], thr[s:s + w],
                             fill, shape, mode, pvq=pvq,
-                            ms=None if ms is None else ms[s:s + w], sblock=sblock, frame=s)
+                            ms=None if ms is None else ms[s:s + w], sblock=sblock)
         frames += w
     return bits / frames
 
@@ -371,9 +361,8 @@ def encode_channel(A, sr, budget, psycho, want_cost=False, fill=True, mode="safe
         recs_all = None
         pulses_all = None
     thr3 = thr.reshape(nfr, nb, WIDTH) if need_thr else None
-    caps = st.band_fill_cap(A3, thr3 if mode == "safe" else None,
-                            FILL_MARGIN) if fill else None
-    energy = st.shape_level_cap(A3, thr3, bits, FILL_MARGIN) if shape else None
+    caps = st.band_fill_cap(A3, thr3 if mode == "safe" else None) if fill else None
+    energy = st.shape_level_cap(A3, thr3, bits) if shape else None
     reg = st.shape_reg(sr, 2 * nc, WIDTH) if shape else None
     shapes = st.shape_window(energy, bits, reg, sblock) if shape else None
     # The fill words are a pure function of this frame's dead runs and its own ceilings, so
@@ -464,16 +453,6 @@ def main():
     shape.add_argument("--no-fill-shape", dest="fill_shape", action="store_false",
                        help="leave dead high bands to the flat fill")
     ap.set_defaults(fill_shape=None)
-    ap.add_argument("--dither", dest="dither", type=float, default=0.0, metavar="LSB",
-                    help="add dither this many quantiser steps before rounding, so quiet bins "
-                         "inside a band land on noise instead of zero. Free at the decoder: the "
-                         "mantissa it reads already contains it. Costs a little noise floor; "
-                         "0 is the undithered quantiser and reproduces older files byte for byte")
-    ap.add_argument("--fill-margin", dest="fill_margin", type=float, default=0.0, metavar="DB",
-                    help="dB of mask the dead-band filler may spend above the quietest bin of "
-                         "the band it fills. 0 is the strict ceiling, where one least-masked bin "
-                         "pins the whole band; 6 to 12 buys back coverage and can never leave a "
-                         "bin more than that far over its mask")
     ap.add_argument("--band-width", dest="band_width",
                     default="auto",
                     help="bins per scalefactor band. auto (default) is 32, or 64 when the frame "
@@ -508,9 +487,6 @@ def main():
     args = ap.parse_args()
     if args.fill_shape is None:
         args.fill_shape = args.fill
-    global FILL_MARGIN
-    FILL_MARGIN = args.fill_margin
-    st.DITHER = args.dither
     # One geometry for the whole file, chosen before the rate solve so the solve and the
     # payload agree, and written to the header so the decoder reads what was written. Band width
     # belongs to that choice, and is taken below because its rule needs the sample rate.

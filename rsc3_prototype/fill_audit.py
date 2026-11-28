@@ -127,7 +127,7 @@ def measure(rec, x, sr, width):
     return out
 
 
-def one(path_mono, rate, arm, width, sr, margin=0.0):
+def one(path_mono, rate, arm, width, sr):
     x, _ = librosa.load(path_mono, sr=sr, mono=False)
     x = np.asarray(x, np.float64)
     if x.ndim == 1:
@@ -146,7 +146,6 @@ def one(path_mono, rate, arm, width, sr, margin=0.0):
              "mean": ["--fill", "--fill-mode", "mean", "--no-fill-shape"],
              "shape": ["--fill", "--fill-mode", "safe", "--fill-shape"],
              "both": ["--fill", "--fill-mode", "safe", "--fill-shape"]}[arm]
-    extra = extra + ["--fill-margin", str(margin)]
     rec, got = capture(wav, rate, width, extra)
     m = measure(rec, ch, sr, width)
     if m is None:
@@ -171,18 +170,16 @@ if __name__ == "__main__":
     ap.add_argument("--rates", default="12,24,64")
     ap.add_argument("--band-width", dest="width", type=int, default=32)
     ap.add_argument("--arms", default="off,flat,shape")
-    ap.add_argument("--margin", type=float, default=0.0,
-                    help="dB of mask the filler may spend, passed to the encoder")
     a = ap.parse_args()
     print("src %s   band width %d   one channel" % (a.src, a.width))
     for rate in [int(v) for v in a.rates.split(",")]:
         for arm in a.arms.split(","):
-            d = one(a.src, rate, arm, a.width, a.sr, a.margin)
+            d = one(a.src, rate, arm, a.width, a.sr)
             if d is None:
                 continue
             cover = 100.0 * d["lit_bands"] / max(d["dead"], 1)
-            print("  %4dk %-5s m%4.0f  %6.2f kbit/s  ES %5.2f  dead %6d  lit %5.1f%%  "
+            print("  %4dk %-5s %6.2f kbit/s  ES %5.2f  dead %6d  lit %5.1f%%  "
                   "bins over %6d (%4.2f%%)  worst %+5.1f dB  hole %+5.1f dB  fill field %4.1f%%"
-                  % (rate, arm, a.margin, d["kbps"], d["es"], d["dead"], cover, d["over"],
+                  % (rate, arm, d["kbps"], d["es"], d["dead"], cover, d["over"],
                      100.0 * d["over"] / max(d["filled"], 1), d["worst"],
                      d["hole"] / max(d["hole_n"], 1), 100.0 * d["fill_bits"] / max(d["bits"], 1)))
